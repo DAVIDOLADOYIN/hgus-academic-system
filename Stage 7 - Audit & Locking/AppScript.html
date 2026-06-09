@@ -963,7 +963,7 @@ Views.sessionSettings = function () {
         '<label class="form-label" for="ss-extid">External Sheet ID</label>' +
         '<input class="form-input" type="text" id="ss-extid" placeholder="Paste the Spreadsheet ID here" ' +
           'value="' + escHtml(s.externalSheetId || '') + '" autocapitalize="none" spellcheck="false">' +
-        '<div class="form-hint">The sheet must have tabs named like "25/26 StudentData" (academic year prefix + "StudentData"). Required columns: Student ID, Full Name, Student Class, Gender, Action Flag.</div>' +
+        '<div class="form-hint">The sheet must have a tab named like "25/26 StudentData" (academic year + "StudentData"). Required columns: <strong>Student ID</strong>, <strong>First Name / Middle Name</strong>, <strong>Last Name (Surname)</strong>, <strong>Class</strong>. Optional: Gender, Action Flag, Date of Birth, Parent / Guardian Contact.</div>' +
       '</div>' +
       '<button class="btn btn--secondary btn--full" id="ss-extid-save-btn" onclick="saveExternalSheetId()">' +
         '<span class="btn-text">Save Sheet ID</span><span class="spinner"></span>' +
@@ -989,6 +989,18 @@ Views.sessionSettings = function () {
           '<div class="sync-action__desc">Updates the student cache for all classes from the external sheet. Run after new students are added or classes change.</div></div>' +
         '<button class="btn btn--secondary" id="ss-refresh-students-btn" onclick="runRefreshStudents()">' +
           '<span class="btn-text">Refresh</span><span class="spinner"></span></button>' +
+      '</div>' +
+      // Progress container — hidden by default, shown during refresh.
+      // refreshProgressShow() / refreshProgressUpdate() / refreshProgressHide()
+      // control its visibility and content.
+      '<div id="ss-refresh-progress" style="display:none;margin-top:var(--space-sm)">' +
+        '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">' +
+          '<span class="text-xs text-muted" id="ss-refresh-progress-label">Starting…</span>' +
+          '<span class="text-xs text-muted" id="ss-refresh-progress-count"></span>' +
+        '</div>' +
+        '<div style="background:var(--grey-200);border-radius:var(--radius-full);height:6px;overflow:hidden">' +
+          '<div id="ss-refresh-progress-bar" style="height:100%;width:0%;background:var(--color-primary);border-radius:var(--radius-full);transition:width .3s ease"></div>' +
+        '</div>' +
       '</div>' +
     '</div>' +
     '</div>'
@@ -1187,38 +1199,176 @@ function runSyncSubjects() {
 }
 
 /**
- * Refresh Student List — step 1: show source confirmation panel.
- * Step 2 (actual refresh) happens inside the onConfirm callback.
- * Saves the confirmed tab name to settings before refreshing so future
- * pull-on-open calls (triggered automatically) use the same source.
+ * Refresh Student List — step 1: confirm the data source tab.
+ * Step 2: save confirmed tab name to settings.
+ * Step 3: fetch the full class list.
+ * Step 4: refresh each class one at a time, updating the progress bar after each.
+ *
+ * This per-class approach (vs a single 'all' call) lets us show real progress
+ * so the Admin always knows how far along the refresh is.
  */
 function runRefreshStudents() {
   pickStudentDataSource('ss-refresh-students-btn', function (tabName) {
-    // Save the confirmed tab name first, then run the cache refresh
+
+    // ── Step 2: save the confirmed tab name ───────────────────────────────
     google.script.run
       .withSuccessHandler(function (saveResult) {
         if (handleSessionExpired(saveResult)) return;
-        // Now run the actual student cache refresh
-        setButtonLoading('ss-refresh-students-btn', true);
+        if (App.settings) App.settings.studentDataTab = tabName;
+
+        // ── Step 3: get the full class list so we can iterate per class ───
         google.script.run
-          .withSuccessHandler(function (result) {
-            setButtonLoading('ss-refresh-students-btn', false);
-            if (handleSessionExpired(result)) return;
-            if (!result.success) { showAlert('ss-sync-result', result.error, 'error'); return; }
-            if (App.settings) App.settings.studentDataTab = tabName;
-            showAlert('ss-sync-result', result.data.message, 'success');
+          .withSuccessHandler(function (classResult) {
+            if (handleSessionExpired(classResult)) return;
+            if (!classResult.success) {
+              showAlert('ss-sync-result', 'Could not load class list. Please try again.', 'error');
+              return;
+            }
+
+            // Only process JSS and SSS classes — same filter the server applies.
+            var classes = (classResult.data || []).filter(function (c) {
+              var n = String(c.className || '').toUpperCase();
+              return n.startsWith('JSS') || n.startsWith('SSS');
+            });
+
+            if (classes.length === 0) {
+              showAlert('ss-sync-result', 'No classes found. Please sync classes first.', 'error');
+              return;
+            }
+
+            // ── Step 4: refresh class by class ────────────────────────────
+            // Disable the button and show the progress bar.
+            setButtonLoading('ss-refresh-students-btn', true);
+            refreshProgressShow(classes.length);
+
+            var completedCount = 0;   // classes finished
+            var totalStudents  = 0;   // students cached across all classes
+            var errors         = [];  // collect any per-class errors
+
+            /**
+             * Refresh one class at index `idx`, then move to the next.
+             * Recursion via the success handler keeps calls sequential —
+             * GAS does not support Promise.all so we chain manually.
+             */
+            function refreshNextClass(idx) {
+              if (idx >= classes.length) {
+                // ── All classes done ───────────────────────────────────────
+                setButtonLoading('ss-refresh-students-btn', false);
+                refreshProgressHide();
+
+                if (errors.length > 0) {
+                  showAlert('ss-sync-result',
+                    totalStudents + ' student(s) refreshed. ' + errors.length + ' class(es) had errors: ' + errors.join(', '),
+                    'error');
+                } else {
+                  showAlert('ss-sync-result',
+                    '✓ ' + totalStudents + ' student(s) refreshed across ' + classes.length + ' class(es). Source: "' + tabName + '".',
+                    'success');
+                }
+                return;
+              }
+
+              var cls = classes[idx];
+              // Update the label before starting this class so the admin sees
+              // which class is currently being processed.
+              refreshProgressUpdate(
+                'Refreshing ' + escHtml(cls.className) + '…',
+                completedCount,
+                classes.length
+              );
+
+              google.script.run
+                .withSuccessHandler(function (result) {
+                  if (handleSessionExpired(result)) return;
+
+                  completedCount++;
+                  if (result && result.success && result.data) {
+                    totalStudents += (result.data.count || 0);
+                  } else {
+                    errors.push(cls.className);
+                  }
+
+                  // Update bar to reflect the completed class.
+                  refreshProgressUpdate(
+                    completedCount < classes.length
+                      ? 'Refreshing ' + escHtml(classes[completedCount].className) + '…'
+                      : 'Finishing up…',
+                    completedCount,
+                    classes.length
+                  );
+
+                  // Move to the next class.
+                  refreshNextClass(idx + 1);
+                })
+                .withFailureHandler(function () {
+                  // Don't abort — log the error and continue with the next class.
+                  completedCount++;
+                  errors.push(cls.className);
+                  refreshProgressUpdate(
+                    completedCount < classes.length
+                      ? 'Refreshing ' + escHtml(classes[completedCount].className) + '…'
+                      : 'Finishing up…',
+                    completedCount,
+                    classes.length
+                  );
+                  refreshNextClass(idx + 1);
+                })
+                .serverRefreshStudentCache(App.token, cls.classId);
+            }
+
+            // Kick off the chain starting at index 0.
+            refreshNextClass(0);
           })
           .withFailureHandler(function () {
-            setButtonLoading('ss-refresh-students-btn', false);
-            showAlert('ss-sync-result', 'Refresh failed. Please try again.', 'error');
+            showAlert('ss-sync-result', 'Could not load class list. Please try again.', 'error');
           })
-          .serverRefreshStudentCache(App.token, 'all');
+          .serverGetClasses(App.token);
       })
       .withFailureHandler(function () {
         showAlert('ss-sync-result', 'Could not save source selection. Please try again.', 'error');
       })
       .serverSetSessionSettings(App.token, { studentDataTab: tabName });
   });
+}
+
+// ─── REFRESH PROGRESS HELPERS ─────────────────────────────────────────────────
+
+/**
+ * Show the progress bar container and set it to 0%.
+ * @param {number} total — total number of classes to refresh
+ */
+function refreshProgressShow(total) {
+  var el = document.getElementById('ss-refresh-progress');
+  if (!el) return;
+  el.style.display = 'block';
+  refreshProgressUpdate('Starting…', 0, total);
+}
+
+/**
+ * Update the progress bar fill, label, and class counter.
+ * @param {string} label   — current status message
+ * @param {number} done    — classes completed so far
+ * @param {number} total   — total classes
+ */
+function refreshProgressUpdate(label, done, total) {
+  var bar   = document.getElementById('ss-refresh-progress-bar');
+  var lbl   = document.getElementById('ss-refresh-progress-label');
+  var count = document.getElementById('ss-refresh-progress-count');
+  if (!bar || !lbl || !count) return;
+
+  var pct = total > 0 ? Math.round((done / total) * 100) : 0;
+  bar.style.width   = pct + '%';
+  lbl.textContent   = label;
+  count.textContent = done + ' of ' + total + ' classes';
+}
+
+/** Hide the progress bar container after refresh completes. */
+function refreshProgressHide() {
+  var el = document.getElementById('ss-refresh-progress');
+  if (el) el.style.display = 'none';
+  // Reset bar to 0 for next time.
+  var bar = document.getElementById('ss-refresh-progress-bar');
+  if (bar) bar.style.width = '0%';
 }
 
 // ─── CLASSES & SUBJECTS ───────────────────────────────────────────────────────

@@ -178,6 +178,7 @@
 | Principal/Head Teacher Comments | Deferred — pending discussion about position-based auto-comment structure |
 | Attendance Module | Not needed — ATT component (0–2) is sufficient for pilot |
 | Carry-forward verification | Must test once a real prior term has assignments; couldn't test with seed data |
+| Scheduled student cache refresh | Auto-refresh cache once daily (early morning) or once at term start using GAS Time-driven Trigger. Requires a no-auth internal wrapper around refreshStudentCache to bypass token validation. Recommendation: once-per-term trigger on termStartDate is more useful than daily. |
 
 ---
 
