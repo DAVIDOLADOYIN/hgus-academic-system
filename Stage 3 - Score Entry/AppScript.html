@@ -1,0 +1,3018 @@
+<script>
+/* ═══════════════════════════════════════════════════════════════════════════
+   HGUS Academic Result Management System — Client-Side SPA
+   Stage 3 — Score Entry
+
+   HOW THIS FILE IS ORGANISED
+   ──────────────────────────
+   1.  App state & constants
+   2.  Initialisation (DOMContentLoaded)
+   3.  Routing  (routeToHome, renderView, initView)
+   4.  Navigation helpers  (navigateTo, navigateBack)  ← Stage 3 additions
+   5.  Session management
+   6.  Inactivity tracking
+   7.  Loading overlay / toast
+   8.  Helpers  (escHtml, formatDate, …)
+   9.  Profile menu + app bar
+   10. Views — Auth  (login, forceChangePassword, changePassword)
+   11. Views — Admin (adminHome updated, sessionSettings, classesSubjects,
+                      assignments, userList, addUser, editUser)
+   12. Views — Teacher home  (two-section FM + TS layout)   ← Stage 3
+   13. Views — Score entry   (fmClassOverview, componentSelector,
+                              scoreEntry, psqEntry, remarksEntry,
+                              manageClassList)               ← Stage 3
+
+   MODIFICATION GUIDE
+   ──────────────────
+   • Adding a view: (a) add Views.myView renderer, (b) add to renderers map
+     in renderView(), (c) add async init to inits map in initView(),
+     (d) add CSS to StyleBase.html.
+   • ALL server-call success handlers MUST call handleSessionExpired(result)
+     as their very first line — see that function's comment for why.
+   • Use navigateTo(view, params) for score-entry screens so the back button
+     works correctly.  Use renderView() only for root-level navigation.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+// ─── 1. APPLICATION STATE ─────────────────────────────────────────────────────
+
+const App = {
+  // ── Always present ───────────────────────────────────────────────────────
+  token:              null,   // auth token (stored in sessionStorage)
+  user:               null,   // { staffId, name, role, forcePasswordChange }
+  settings:           null,   // active session/term settings
+
+  // ── View tracking ────────────────────────────────────────────────────────
+  currentView:        null,
+  viewParams:         {},
+  profileMenuOpen:    false,
+
+  // ── Timers ───────────────────────────────────────────────────────────────
+  inactivityTimer:    null,
+  usernameCheckTimer: null,
+
+  // ── Stage 3: back-navigation history ─────────────────────────────────────
+  // navigateTo() pushes here; navigateBack() pops.
+  // Always reset to [] on routeToHome() and clearSession().
+  _navHistory:         [],
+
+  // ── Stage 3: cached assignment data ──────────────────────────────────────
+  // Loaded once in initAdminHome or initTeacherHome and reused until logout.
+  _assignmentsLoaded:  false,
+  _myFMClasses:        [],   // [{ assignmentId, classId, className, grantedFullAccess }]
+  _myTSAssignments:    [],   // [{ assignmentId, classId, className, subjectId, subjectName, term, session }]
+
+  // ── Stage 3: transient score-entry screen state ───────────────────────────
+  // Each field is replaced each time a new screen is entered.
+  _scoreData:          null,  // from serverGetScoresForComponent
+  _psqData:            null,  // from serverGetClassPSQ
+  _remarksData:        null,  // from serverGetClassRemarks
+  _statusData:         null,  // from serverGetClassStudentStatus
+  _currentPsqIndex:    0      // which student is active in PSQ entry
+};
+
+const TOKEN_KEY     = 'hgus_token';   // sessionStorage key
+const INACTIVITY_MS = 5 * 60 * 1000; // 5-minute auto-logout
+
+// ─── 2. INITIALISATION ───────────────────────────────────────────────────────
+
+document.addEventListener('DOMContentLoaded', function () {
+  App.token = sessionStorage.getItem(TOKEN_KEY);
+  if (App.token) {
+    showLoading('Restoring your session…');
+    google.script.run
+      .withSuccessHandler(onSessionValidated)
+      .withFailureHandler(function () { onSessionValidated({ valid: false }); })
+      .serverValidateSession(App.token);
+  } else {
+    renderView('login');
+  }
+  setupInactivityTracking();
+});
+
+function onSessionValidated(result) {
+  hideLoading();
+  if (!result.valid) {
+    clearSession();
+    renderView('login');
+  } else {
+    App.user     = result.session;
+    App.settings = result.settings;
+    routeToHome();
+  }
+}
+
+// ─── 3. ROUTING ──────────────────────────────────────────────────────────────
+
+/**
+ * Navigate to the correct home screen for the logged-in user's role.
+ * Always resets the back-navigation history (home is always the root).
+ */
+function routeToHome() {
+  App._navHistory = []; // home is always the root — clear any back history
+  if (App.user.forcePasswordChange) {
+    renderView('forceChangePassword');
+    return;
+  }
+  const role = App.user.role;
+  if (role === 'Super Admin' || role === 'Admin') {
+    renderView('adminHome');
+  } else {
+    renderView('teacherHome');
+  }
+}
+
+/**
+ * Render a named view, passing optional params to the renderer and init.
+ * For score-entry drill-down screens, prefer navigateTo() so back works.
+ * Use renderView() directly only for home / login / top-level screens.
+ *
+ * @param {string}  view   - Key in the renderers map below
+ * @param {Object} [params] - Data available to the renderer and init function
+ */
+function renderView(view, params) {
+  App.currentView     = view;
+  App.viewParams      = params || {};
+  App.profileMenuOpen = false;
+
+  const app = document.getElementById('app');
+
+  const renderers = {
+    // ── Auth (all stages) ─────────────────────────────────────────────────
+    login:                Views.login,
+    forceChangePassword:  Views.forceChangePassword,
+    changePassword:       Views.changePassword,
+
+    // ── Admin management (Stage 1–2, unchanged) ───────────────────────────
+    adminHome:            Views.adminHome,
+    sessionSettings:      Views.sessionSettings,
+    classesSubjects:      Views.classesSubjects,
+    assignments:          Views.assignments,
+    userList:             Views.userList,
+    addUser:              Views.addUser,
+    editUser:             Views.editUser,
+
+    // ── Score entry (Stage 3) ─────────────────────────────────────────────
+    teacherHome:          Views.teacherHome,
+    fmClassOverview:      Views.fmClassOverview,
+    componentSelector:    Views.componentSelector,
+    scoreEntry:           Views.scoreEntry,
+    psqEntry:             Views.psqEntry,
+    remarksEntry:         Views.remarksEntry,
+    manageClassList:      Views.manageClassList
+  };
+
+  if (!renderers[view]) {
+    app.innerHTML = '<p style="padding:16px">Unknown view: ' + view + '</p>';
+    return;
+  }
+  app.innerHTML = renderers[view](App.viewParams);
+  initView(view, App.viewParams);
+  resetInactivityTimer();
+}
+
+/**
+ * Call the async initialiser for a view (if one exists).
+ * Initialisers fetch server data and fill in the loading-state placeholder
+ * HTML that the Views.xxx renderer already put on screen.
+ */
+function initView(view, params) {
+  const inits = {
+    // Stage 1–2
+    adminHome:         initAdminHome,      // updated in Stage 3
+    userList:          initUserList,
+    addUser:           initAddUser,
+    editUser:          initEditUser,
+    sessionSettings:   initSessionSettings,
+    classesSubjects:   initClassesSubjects,
+    assignments:       initAssignments,
+
+    // Stage 3
+    teacherHome:       initTeacherHome,
+    fmClassOverview:   initFmClassOverview,
+    componentSelector: initComponentSelector,
+    scoreEntry:        initScoreEntry,
+    psqEntry:          initPsqEntry,
+    remarksEntry:      initRemarksEntry,
+    manageClassList:   initManageClassList
+  };
+  if (inits[view]) inits[view](params);
+}
+
+// ─── 4. NAVIGATION HELPERS (Stage 3) ─────────────────────────────────────────
+
+/**
+ * Navigate to a view and push the current position onto the back-stack.
+ * Use this for all score-entry screens so the ← back button is
+ * context-aware regardless of how the user arrived at the screen.
+ *
+ * Example:
+ *   navigateTo('componentSelector', { classId:'JSS1', subjectId:'MATH01', ... })
+ *
+ * @param {string}  view    - Target view name
+ * @param {Object} [params] - Params passed to the target renderer and init
+ */
+function navigateTo(view, params) {
+  if (App.currentView) {
+    App._navHistory.push({ view: App.currentView, params: App.viewParams });
+  }
+  renderView(view, params);
+}
+
+/**
+ * Return to the previous view by popping the back-stack.
+ * Falls back to routeToHome() if the stack is empty.
+ */
+function navigateBack() {
+  const prev = App._navHistory.pop();
+  if (prev) renderView(prev.view, prev.params);
+  else      routeToHome();
+}
+
+// ─── 5. SESSION MANAGEMENT ───────────────────────────────────────────────────
+
+function saveSession(token, user, settings) {
+  App.token    = token;
+  App.user     = user;
+  App.settings = settings || App.settings;
+  sessionStorage.setItem(TOKEN_KEY, token);
+}
+
+/**
+ * Clear ALL client-side state, including Stage 3 caches.
+ * Called on logout, session expiry, and navigation to login.
+ */
+function clearSession() {
+  App.token    = null;
+  App.user     = null;
+  App.settings = null;
+  sessionStorage.removeItem(TOKEN_KEY);
+  // Reset Stage 3 state so stale data is never shown after re-login
+  App._navHistory        = [];
+  App._assignmentsLoaded = false;
+  App._myFMClasses       = [];
+  App._myTSAssignments   = [];
+  App._scoreData         = null;
+  App._psqData           = null;
+  App._remarksData       = null;
+  App._statusData        = null;
+  App._currentPsqIndex   = 0;
+}
+
+/**
+ * Central SESSION_EXPIRED guard — call at the TOP of every
+ * withSuccessHandler that sends a token to the server.
+ *
+ * If the server responded with { success:false, code:'SESSION_EXPIRED' }
+ * this function clears the session, goes to login, shows a toast, and
+ * returns TRUE so the caller can immediately return without further action.
+ *
+ * Usage:
+ *   .withSuccessHandler(function (result) {
+ *     if (handleSessionExpired(result)) return;
+ *     … normal handler logic …
+ *   })
+ */
+function handleSessionExpired(result) {
+  if (result && !result.success && result.code === 'SESSION_EXPIRED') {
+    clearSession();
+    renderView('login');
+    showToast('Your session has expired. Please log in again.', 'error');
+    return true;
+  }
+  return false;
+}
+
+function logout() {
+  closeProfileMenu();
+  const token = App.token;
+  clearSession();
+  if (token) google.script.run.serverLogout(token);
+  renderView('login');
+  showToast('You have been logged out.', 'default');
+}
+
+// ─── 6. INACTIVITY TRACKING ──────────────────────────────────────────────────
+
+function setupInactivityTracking() {
+  ['click', 'keydown', 'touchstart', 'scroll'].forEach(function (ev) {
+    document.addEventListener(ev, resetInactivityTimer, { passive: true });
+  });
+}
+
+function resetInactivityTimer() {
+  if (App.inactivityTimer) clearTimeout(App.inactivityTimer);
+  if (App.token) {
+    App.inactivityTimer = setTimeout(function () {
+      clearSession();
+      renderView('login');
+      showToast('You were logged out due to inactivity.', 'default');
+    }, INACTIVITY_MS);
+  }
+}
+
+// ─── 7. LOADING OVERLAY / TOAST ──────────────────────────────────────────────
+
+function showLoading(msg) {
+  let overlay = document.getElementById('loading-overlay');
+  if (!overlay) {
+    overlay = document.createElement('div');
+    overlay.id = 'loading-overlay';
+    overlay.className = 'loading-overlay';
+    document.body.appendChild(overlay);
+  }
+  overlay.innerHTML =
+    '<div class="spinner spinner--blue"></div>' +
+    '<p>' + (msg || 'Loading…') + '</p>';
+  overlay.style.display = 'flex';
+}
+
+function hideLoading() {
+  const overlay = document.getElementById('loading-overlay');
+  if (overlay) overlay.style.display = 'none';
+}
+
+function showToast(message, type) {
+  let container = document.getElementById('toast-container');
+  if (!container) {
+    container = document.createElement('div');
+    container.id = 'toast-container';
+    container.className = 'toast-container';
+    document.body.appendChild(container);
+  }
+  const toast = document.createElement('div');
+  toast.className = 'toast' +
+    (type === 'success' ? ' toast--success' : type === 'error' ? ' toast--error' : '');
+  toast.textContent = message;
+  container.appendChild(toast);
+  requestAnimationFrame(function () {
+    requestAnimationFrame(function () { toast.classList.add('toast--show'); });
+  });
+  setTimeout(function () {
+    toast.classList.remove('toast--show');
+    setTimeout(function () { if (container.contains(toast)) container.removeChild(toast); }, 300);
+  }, 3500);
+}
+
+// ─── 8. HELPERS ──────────────────────────────────────────────────────────────
+
+function escHtml(str) {
+  if (!str && str !== 0) return '';
+  return String(str)
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+function initials(name) {
+  if (!name) return '?';
+  const parts = String(name).trim().split(/\s+/);
+  return (parts[0][0] + (parts[1] ? parts[1][0] : '')).toUpperCase();
+}
+
+function roleBadge(role) {
+  const map = { 'Super Admin': 'super-admin', 'Admin': 'admin', 'Teacher': 'teacher' };
+  return '<span class="badge badge--' + (map[role] || 'teacher') + '">' + escHtml(role) + '</span>';
+}
+
+function statusBadge(status) {
+  const map = { 'Active': 'active', 'On Leave': 'on-leave', 'Resigned': 'resigned' };
+  return '<span class="badge badge--' + (map[status] || 'active') + '">' + escHtml(status) + '</span>';
+}
+
+function sessionLabel() {
+  if (!App.settings) return '';
+  const s = App.settings;
+  if (!s.activeSession && !s.activeTerm) return 'No session set';
+  return (s.activeSession || '') + (s.activeTerm ? ' · ' + s.activeTerm : '');
+}
+
+function formatDateTime(isoStr) {
+  if (!isoStr) return '—';
+  const d = new Date(isoStr);
+  if (isNaN(d.getTime())) return String(isoStr);
+  const DAYS   = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+  const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  return DAYS[d.getDay()] + ', ' + String(d.getDate()).padStart(2,'0') +
+    ' ' + MONTHS[d.getMonth()] + ', ' + d.getFullYear() +
+    ' ' + String(d.getHours()).padStart(2,'0') + ':' + String(d.getMinutes()).padStart(2,'0');
+}
+
+function formatDate(isoStr) {
+  if (!isoStr) return '—';
+  const d = new Date(isoStr);
+  if (isNaN(d.getTime())) return String(isoStr);
+  const DAYS   = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+  const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  return DAYS[d.getDay()] + ', ' + String(d.getDate()).padStart(2,'0') +
+    ' ' + MONTHS[d.getMonth()] + ', ' + d.getFullYear();
+}
+
+function setButtonLoading(btnId, loading) {
+  const btn = document.getElementById(btnId);
+  if (!btn) return;
+  if (loading) { btn.classList.add('btn-loading'); btn.disabled = true; }
+  else         { btn.classList.remove('btn-loading'); btn.disabled = false; }
+}
+
+function showFieldError(fieldId, message) {
+  const field = document.getElementById(fieldId);
+  if (field) field.classList.add('error');
+  const hint = document.getElementById(fieldId + '-hint');
+  if (hint) { hint.textContent = message; hint.className = 'form-hint error'; }
+}
+
+function clearFieldError(fieldId) {
+  const field = document.getElementById(fieldId);
+  if (field) field.classList.remove('error');
+  const hint = document.getElementById(fieldId + '-hint');
+  if (hint) { hint.textContent = ''; hint.className = 'form-hint'; }
+}
+
+function showAlert(containerId, message, type) {
+  const container = document.getElementById(containerId);
+  if (!container) return;
+  container.innerHTML =
+    '<div class="alert alert--' + (type || 'error') + '">' +
+    '<span>' + escHtml(message) + '</span></div>';
+}
+
+function clearAlert(containerId) {
+  const container = document.getElementById(containerId);
+  if (container) container.innerHTML = '';
+}
+
+// ─── 9. PROFILE MENU + APP BAR ───────────────────────────────────────────────
+
+function toggleProfileMenu() {
+  if (App.profileMenuOpen) closeProfileMenu();
+  else openProfileMenu();
+}
+
+function openProfileMenu() {
+  const existing = document.getElementById('profile-menu');
+  if (existing) existing.remove();
+  App.profileMenuOpen = true;
+  const isAdmin = App.user && (App.user.role === 'Admin' || App.user.role === 'Super Admin');
+  const menu = document.createElement('div');
+  menu.id = 'profile-menu';
+  menu.className = 'profile-menu';
+  menu.innerHTML =
+    '<div class="profile-menu__header">' +
+      '<div class="profile-menu__name">' + escHtml(App.user ? App.user.name : '') + '</div>' +
+      '<div class="profile-menu__role">' + escHtml(App.user ? App.user.role : '') +
+        ' · ' + escHtml(App.user ? App.user.staffId : '') + '</div>' +
+    '</div>' +
+    '<button class="profile-menu__item" onclick="goChangePassword()">🔑 Change Password</button>' +
+    (isAdmin
+      ? '<button class="profile-menu__item" onclick="closeProfileMenu();renderView(\'adminHome\')">🏠 Admin Home</button>'
+      : '') +
+    '<button class="profile-menu__item profile-menu__item--danger" onclick="logout()">🚪 Log Out</button>';
+  document.querySelector('.app-bar') && document.querySelector('.app-bar').appendChild(menu);
+  setTimeout(function () {
+    document.addEventListener('click', function outsideClick(e) {
+      if (!menu.contains(e.target)) {
+        closeProfileMenu();
+        document.removeEventListener('click', outsideClick);
+      }
+    });
+  }, 0);
+}
+
+function closeProfileMenu() {
+  const menu = document.getElementById('profile-menu');
+  if (menu) menu.remove();
+  App.profileMenuOpen = false;
+}
+
+function goChangePassword() { closeProfileMenu(); renderView('changePassword'); }
+
+/**
+ * Build the top app-bar HTML string.
+ *
+ * @param {string}  title      - Main heading shown in the bar
+ * @param {string}  subtitle   - Smaller subheading below the title
+ * @param {boolean} showBack   - Whether to render a back arrow
+ * @param {string}  backTarget - View name to jump to, OR the special string
+ *                               'back' to call navigateBack() (history-aware).
+ *                               Use 'back' for all Stage 3 drill-down screens.
+ */
+function appBarHtml(title, subtitle, showBack, backTarget) {
+  // Decide the onclick action for the back button
+  const backAction = (backTarget === 'back')
+    ? 'navigateBack()'
+    : "renderView('" + (backTarget || '') + "')";
+
+  const user = App.user;
+  return (
+    '<div class="app-bar">' +
+      (showBack
+        // SVG chevron instead of a Unicode arrow — guarantees pixel-perfect
+        // vertical centering on all Android/iOS fonts regardless of glyph metrics.
+        ? '<button class="app-bar__back" onclick="' + backAction + '" aria-label="Back">' +
+          '<svg width="9" height="15" viewBox="0 0 9 15" fill="none" aria-hidden="true">' +
+          '<path d="M7.5 1.5L2 7.5L7.5 13.5" stroke="white" stroke-width="2.2" ' +
+          'stroke-linecap="round" stroke-linejoin="round"/>' +
+          '</svg>' +
+          '</button>'
+        : '') +
+      '<div class="app-bar__title">' +
+        '<h1>' + escHtml(title) + '</h1>' +
+        (subtitle ? '<div class="subtitle">' + escHtml(subtitle) + '</div>' : '') +
+      '</div>' +
+      '<span class="session-badge">' + escHtml(sessionLabel()) + '</span>' +
+      '<button class="app-bar__avatar" onclick="toggleProfileMenu()" aria-label="Profile menu">' +
+        (user ? initials(user.name) : '?') +
+      '</button>' +
+    '</div>'
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 10. VIEWS — AUTH
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const Views = {};
+
+// ─── COMPONENT DISPLAY LABELS ─────────────────────────────────────────────────
+// Maps server-side component keys to the user-facing display names used on
+// both the componentSelector tiles and the scoreEntry app bar.
+// The server keys (C/W, Test1, etc.) are used for data storage and must not
+// change. Only update the VALUES here if you want to rename them in the UI.
+const COMPONENT_DISPLAY_LABEL = {
+  'C/W':   'Class Work',
+  'ASS':   'Assignment',
+  'ATT':   'Attendance',
+  'Test1': 'CA Test 1',
+  'Test2': 'CA Test 2',
+  'Exam':  'Examination'
+};
+
+// ─── LOGIN ────────────────────────────────────────────────────────────────────
+
+Views.login = function () {
+  return (
+    '<div class="login-screen">' +
+      '<div class="login-logo">' +
+        '<span class="login-logo__icon">🎓</span>' +
+        '<h1>His Grace Universal Schools</h1>' +
+        '<p>Academic Result Management System</p>' +
+      '</div>' +
+      '<div class="login-card">' +
+        '<h2>Sign In</h2>' +
+        '<div id="login-alert"></div>' +
+        '<div class="form-group">' +
+          '<label class="form-label" for="login-username">Username</label>' +
+          '<input class="form-input" type="text" id="login-username" autocomplete="username" ' +
+            'autocapitalize="none" spellcheck="false" placeholder="Enter your username">' +
+        '</div>' +
+        '<div class="form-group">' +
+          '<label class="form-label" for="login-password">Password</label>' +
+          '<div class="input-wrapper">' +
+            '<input class="form-input form-input--icon" type="password" id="login-password" ' +
+              'autocomplete="current-password" placeholder="Enter your password">' +
+            '<button class="input-icon-btn" onclick="togglePwVisibility(\'login-password\',this)" ' +
+              'type="button" aria-label="Show/hide password">👁</button>' +
+          '</div>' +
+        '</div>' +
+        '<div id="login-error" class="mb-md"></div>' +
+        '<button class="btn btn--primary btn--full" id="login-btn" onclick="submitLogin()">' +
+          '<span class="btn-text">Sign In</span><span class="spinner"></span>' +
+        '</button>' +
+        '<p class="text-center text-xs text-muted mt-md">Forgot your password? Contact your administrator.</p>' +
+      '</div>' +
+    '</div>'
+  );
+};
+
+function togglePwVisibility(inputId, btn) {
+  const input = document.getElementById(inputId);
+  if (!input) return;
+  if (input.type === 'password') { input.type = 'text'; btn.textContent = '🙈'; }
+  else                           { input.type = 'password'; btn.textContent = '👁'; }
+}
+
+function submitLogin() {
+  const username = (document.getElementById('login-username').value || '').trim();
+  const password = document.getElementById('login-password').value || '';
+  clearAlert('login-error');
+  if (!username) { showAlert('login-error', 'Please enter your username.', 'error'); return; }
+  if (!password) { showAlert('login-error', 'Please enter your password.', 'error'); return; }
+  setButtonLoading('login-btn', true);
+  google.script.run
+    .withSuccessHandler(onLoginResult)
+    .withFailureHandler(function () {
+      setButtonLoading('login-btn', false);
+      showAlert('login-error', 'Connection error. Please try again.', 'error');
+    })
+    .serverLogin(username, password);
+}
+
+function onLoginResult(result) {
+  setButtonLoading('login-btn', false);
+  if (!result.success) { showAlert('login-error', result.error, 'error'); return; }
+  google.script.run
+    .withSuccessHandler(function (settingsResult) {
+      const settings = (settingsResult && settingsResult.success) ? settingsResult.data : {};
+      saveSession(result.token, result.user, settings);
+      if (result.forcePasswordChange) renderView('forceChangePassword');
+      else { routeToHome(); showToast('Welcome back, ' + result.user.name.split(' ')[0] + '!', 'success'); }
+    })
+    .withFailureHandler(function () {
+      saveSession(result.token, result.user, {});
+      if (result.forcePasswordChange) renderView('forceChangePassword');
+      else routeToHome();
+    })
+    .serverGetSessionSettings(result.token);
+}
+
+// ─── FORCE CHANGE PASSWORD ────────────────────────────────────────────────────
+
+Views.forceChangePassword = function () {
+  const greeting = (App.user && App.user.role === 'Super Admin')
+    ? 'Welcome, Super Admin! Set your password to continue.'
+    : 'Welcome! You must set a new password before continuing.';
+  return (
+    '<div class="login-screen">' +
+      '<div class="login-logo"><span class="login-logo__icon">🔐</span><h1>Set Your Password</h1></div>' +
+      '<div class="login-card">' +
+        '<div class="alert alert--info mb-md">' + escHtml(greeting) + '</div>' +
+        '<div class="form-group">' +
+          '<label class="form-label" for="fcp-new">New Password</label>' +
+          '<div class="input-wrapper">' +
+            '<input class="form-input form-input--icon" type="password" id="fcp-new" autocomplete="new-password" placeholder="At least 8 characters">' +
+            '<button class="input-icon-btn" onclick="togglePwVisibility(\'fcp-new\',this)" type="button">👁</button>' +
+          '</div>' +
+          '<div class="form-hint" id="fcp-new-hint"></div>' +
+        '</div>' +
+        '<div class="form-group">' +
+          '<label class="form-label" for="fcp-confirm">Confirm Password</label>' +
+          '<div class="input-wrapper">' +
+            '<input class="form-input form-input--icon" type="password" id="fcp-confirm" autocomplete="new-password" placeholder="Re-enter your password">' +
+            '<button class="input-icon-btn" onclick="togglePwVisibility(\'fcp-confirm\',this)" type="button">👁</button>' +
+          '</div>' +
+          '<div class="form-hint" id="fcp-confirm-hint"></div>' +
+        '</div>' +
+        '<div id="fcp-alert" class="mb-md"></div>' +
+        '<button class="btn btn--primary btn--full" id="fcp-btn" onclick="submitForceChange()">' +
+          '<span class="btn-text">Set Password &amp; Continue</span><span class="spinner"></span>' +
+        '</button>' +
+      '</div>' +
+    '</div>'
+  );
+};
+
+function submitForceChange() {
+  const newPw  = document.getElementById('fcp-new').value    || '';
+  const confPw = document.getElementById('fcp-confirm').value || '';
+  clearAlert('fcp-alert'); clearFieldError('fcp-new'); clearFieldError('fcp-confirm');
+  if (newPw.length < 8) { showFieldError('fcp-new', 'Password must be at least 8 characters.'); return; }
+  if (newPw !== confPw)  { showFieldError('fcp-confirm', 'Passwords do not match.'); return; }
+  setButtonLoading('fcp-btn', true);
+  google.script.run
+    .withSuccessHandler(function (result) {
+      setButtonLoading('fcp-btn', false);
+      if (handleSessionExpired(result)) return;
+      if (!result.success) { showAlert('fcp-alert', result.error, 'error'); return; }
+      App.user.forcePasswordChange = false;
+      routeToHome();
+      showToast('Password set successfully!', 'success');
+    })
+    .withFailureHandler(function () {
+      setButtonLoading('fcp-btn', false);
+      showAlert('fcp-alert', 'Connection error. Please try again.', 'error');
+    })
+    .serverForceChangePassword(App.token, newPw, confPw);
+}
+
+// ─── CHANGE PASSWORD (voluntary) ─────────────────────────────────────────────
+
+Views.changePassword = function () {
+  const back = (App.user && (App.user.role === 'Super Admin' || App.user.role === 'Admin'))
+    ? 'adminHome' : 'teacherHome';
+  return (
+    appBarHtml('Change Password', 'Update your password', true, back) +
+    '<div class="page-content"><div class="card card--pad">' +
+      '<div id="cp-alert" class="mb-md"></div>' +
+      '<div class="form-group"><label class="form-label" for="cp-current">Current Password</label>' +
+        '<div class="input-wrapper"><input class="form-input form-input--icon" type="password" id="cp-current" autocomplete="current-password" placeholder="Your current password">' +
+        '<button class="input-icon-btn" onclick="togglePwVisibility(\'cp-current\',this)" type="button">👁</button></div>' +
+        '<div class="form-hint error hidden" id="cp-current-hint"></div></div>' +
+      '<div class="form-group"><label class="form-label" for="cp-new">New Password</label>' +
+        '<div class="input-wrapper"><input class="form-input form-input--icon" type="password" id="cp-new" autocomplete="new-password" placeholder="At least 8 characters">' +
+        '<button class="input-icon-btn" onclick="togglePwVisibility(\'cp-new\',this)" type="button">👁</button></div>' +
+        '<div class="form-hint error hidden" id="cp-new-hint"></div></div>' +
+      '<div class="form-group"><label class="form-label" for="cp-confirm">Confirm New Password</label>' +
+        '<div class="input-wrapper"><input class="form-input form-input--icon" type="password" id="cp-confirm" autocomplete="new-password" placeholder="Re-enter your new password">' +
+        '<button class="input-icon-btn" onclick="togglePwVisibility(\'cp-confirm\',this)" type="button">👁</button></div>' +
+        '<div class="form-hint error hidden" id="cp-confirm-hint"></div></div>' +
+      '<button class="btn btn--primary btn--full mt-md" id="cp-btn" onclick="submitChangePassword()">' +
+        '<span class="btn-text">Update Password</span><span class="spinner"></span></button>' +
+    '</div></div>'
+  );
+};
+
+function submitChangePassword() {
+  clearAlert('cp-alert'); clearFieldError('cp-current'); clearFieldError('cp-new'); clearFieldError('cp-confirm');
+  const current = document.getElementById('cp-current').value || '';
+  const newPw   = document.getElementById('cp-new').value     || '';
+  const conf    = document.getElementById('cp-confirm').value  || '';
+  let valid = true;
+  if (!current)          { showFieldError('cp-current', 'Current password is required.'); valid = false; }
+  if (newPw.length < 8)  { showFieldError('cp-new', 'Password must be at least 8 characters.'); valid = false; }
+  if (newPw !== conf)    { showFieldError('cp-confirm', 'Passwords do not match.'); valid = false; }
+  if (!valid) return;
+  setButtonLoading('cp-btn', true);
+  google.script.run
+    .withSuccessHandler(function (result) {
+      setButtonLoading('cp-btn', false);
+      if (handleSessionExpired(result)) return;
+      if (!result.success) {
+        if (result.code === 'WRONG_PASSWORD') showFieldError('cp-current', 'Current password is incorrect.');
+        else showAlert('cp-alert', result.error, 'error');
+        return;
+      }
+      showToast('Password changed successfully.', 'success');
+      const back = (App.user && (App.user.role === 'Super Admin' || App.user.role === 'Admin'))
+        ? 'adminHome' : 'teacherHome';
+      renderView(back);
+    })
+    .withFailureHandler(function () {
+      setButtonLoading('cp-btn', false);
+      showAlert('cp-alert', 'Connection error. Please try again.', 'error');
+    })
+    .serverChangePassword(App.token, current, newPw, conf);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 11. VIEWS — ADMIN
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ─── ADMIN HOME ───────────────────────────────────────────────────────────────
+
+/**
+ * Admin Home — 6 management tiles plus a 7th "My Teaching" tile that is
+ * hidden by default and revealed by initAdminHome() if this admin has
+ * been assigned as Form Master or Teacher Subject for any class.
+ */
+Views.adminHome = function () {
+  const role = App.user ? App.user.role : 'Admin';
+  const name = App.user ? App.user.name.split(' ')[0] : '';
+
+  const tiles = [
+    { icon: '👥', label: 'User List',          sub: 'Manage staff accounts',   view: 'userList'        },
+    { icon: '🏫', label: 'Classes & Subjects', sub: 'Sync and manage data',    view: 'classesSubjects' },
+    { icon: '📋', label: 'Manage Assignments', sub: 'Form Masters & Teachers', view: 'assignments'     },
+    { icon: '⚙️', label: 'Session Settings',  sub: 'Active term, sync data',  view: 'sessionSettings' },
+    { icon: '📊', label: 'Results Overview',   sub: 'All classes progress',    view: null, soon: true   },
+    { icon: '🗄️', label: 'Archive Session',   sub: 'End-of-year backup',      view: null, soon: true   }
+  ];
+
+  const tilesHtml = tiles.map(function (t) {
+    const onclick = t.soon
+      ? 'onclick="showToast(\'Coming in a later stage!\',\'default\')"'
+      : 'onclick="renderView(\'' + t.view + '\')"';
+    return (
+      '<button class="nav-tile' + (t.soon ? ' nav-tile--disabled' : '') + '" ' + onclick + '>' +
+        '<span class="nav-tile__icon">' + t.icon + '</span>' +
+        '<span class="nav-tile__label">' + escHtml(t.label) + '</span>' +
+        '<span class="nav-tile__sub">' + escHtml(t.sub) + (t.soon ? ' (coming soon)' : '') + '</span>' +
+      '</button>'
+    );
+  }).join('');
+
+  // "My Teaching" tile — hidden until initAdminHome confirms this admin
+  // has at least one FM or TS assignment for the active session.
+  // Uses navigateTo() so the admin can tap back to return here.
+  const myTeachingTile =
+    '<button class="nav-tile" id="admin-my-teaching-tile" style="display:none" ' +
+      'onclick="navigateTo(\'teacherHome\')">' +
+      '<span class="nav-tile__icon">📝</span>' +
+      '<span class="nav-tile__label">My Teaching</span>' +
+      '<span class="nav-tile__sub">Enter scores &amp; PSQ</span>' +
+    '</button>';
+
+  return (
+    appBarHtml('Good day, ' + name + '!', role + ' Panel', false) +
+    '<div class="section-header mt-sm">' + escHtml(sessionLabel()) + '</div>' +
+    '<div class="nav-tiles">' + tilesHtml + myTeachingTile + '</div>'
+  );
+};
+
+/**
+ * Check whether this admin has any teaching assignments.
+ * If yes, reveal the "My Teaching" tile and cache the assignment data
+ * so that teacherHome can reuse it without a second server call.
+ */
+function initAdminHome() {
+  google.script.run
+    .withSuccessHandler(function (result) {
+      if (handleSessionExpired(result)) return;
+      if (!result.success) return; // silently ignore — tile stays hidden
+      const data             = result.data || {};
+      App._myFMClasses       = data.fmClasses    || [];
+      App._myTSAssignments   = data.tsAssignments || [];
+      App._assignmentsLoaded = true;
+      // Only show the tile if there is at least one assignment
+      if (App._myFMClasses.length > 0 || App._myTSAssignments.length > 0) {
+        const tile = document.getElementById('admin-my-teaching-tile');
+        if (tile) tile.style.display = '';
+      }
+    })
+    .withFailureHandler(function () {
+      // Silently fail — admin simply won't see the tile
+    })
+    .serverGetMyAssignments(App.token);
+}
+
+// ─── SESSION SETTINGS ────────────────────────────────────────────────────────
+
+Views.sessionSettings = function () {
+  const s = App.settings || {};
+  const termOptions = ['First Term', 'Second Term', 'Third Term'].map(function (t) {
+    return '<option value="' + t + '"' + (s.activeTerm === t ? ' selected' : '') + '>' + t + '</option>';
+  }).join('');
+
+  return (
+    appBarHtml('Session Settings', 'Active term & data sync', true, 'adminHome') +
+    '<div class="page-content">' +
+    '<div class="card card--pad mb-md">' +
+      '<div class="section-header-inline">Academic Period</div>' +
+      '<div id="ss-alert" class="mb-md"></div>' +
+      '<div class="form-group">' +
+        '<label class="form-label" for="ss-session">Active Session</label>' +
+        '<input class="form-input" type="text" id="ss-session" placeholder="e.g. 2025/2026" value="' + escHtml(s.activeSession || '') + '">' +
+        '<div class="form-hint">Format: YYYY/YYYY (e.g. 2025/2026)</div>' +
+      '</div>' +
+      '<div class="form-group">' +
+        '<label class="form-label" for="ss-term">Active Term</label>' +
+        '<select class="form-select" id="ss-term">' + termOptions + '</select>' +
+      '</div>' +
+      '<div class="form-row">' +
+        '<div class="form-group" style="flex:1">' +
+          '<label class="form-label" for="ss-start">Term Start Date</label>' +
+          '<input class="form-input" type="date" id="ss-start" value="' + escHtml(s.termStartDate || '') + '">' +
+        '</div>' +
+        '<div class="form-group" style="flex:1">' +
+          '<label class="form-label" for="ss-end">Term End Date</label>' +
+          '<input class="form-input" type="date" id="ss-end" value="' + escHtml(s.termEndDate || '') + '">' +
+        '</div>' +
+      '</div>' +
+      '<div class="form-row">' +
+        '<div class="form-group" style="flex:1">' +
+          '<label class="form-label" for="ss-fee">Next Term Fee (₦)</label>' +
+          '<input class="form-input" type="text" id="ss-fee" placeholder="e.g. 45,000" value="' + escHtml(s.nextTermFee || '') + '">' +
+        '</div>' +
+        '<div class="form-group" style="flex:1">' +
+          '<label class="form-label" for="ss-resumption">Next Term Resumption</label>' +
+          '<input class="form-input" type="date" id="ss-resumption" value="' + escHtml(s.nextTermResumption || '') + '">' +
+        '</div>' +
+      '</div>' +
+      '<button class="btn btn--primary btn--full mt-sm" id="ss-save-btn" onclick="saveSessionSettings()">' +
+        '<span class="btn-text">Save Settings</span><span class="spinner"></span>' +
+      '</button>' +
+    '</div>' +
+    '<div class="card card--pad mb-md">' +
+      '<div class="section-header-inline">External Student Data Sheet</div>' +
+      '<p class="text-sm text-muted mb-md">Enter the Google Spreadsheet ID of the school\'s student registration sheet. ' +
+        'This is the long ID in the URL: docs.google.com/spreadsheets/d/<strong>SPREADSHEET_ID</strong>/edit</p>' +
+      '<div class="form-group">' +
+        '<label class="form-label" for="ss-extid">External Sheet ID</label>' +
+        '<input class="form-input" type="text" id="ss-extid" placeholder="Paste the Spreadsheet ID here" ' +
+          'value="' + escHtml(s.externalSheetId || '') + '" autocapitalize="none" spellcheck="false">' +
+        '<div class="form-hint">The sheet must have a tab whose name contains "StudentData" with columns: Student ID, Full Name, Student Class, Gender, Action Flag.</div>' +
+      '</div>' +
+      '<button class="btn btn--secondary btn--full" id="ss-extid-save-btn" onclick="saveExternalSheetId()">' +
+        '<span class="btn-text">Save Sheet ID</span><span class="spinner"></span>' +
+      '</button>' +
+    '</div>' +
+    '<div class="card card--pad mb-md">' +
+      '<div class="section-header-inline">Data Sync</div>' +
+      '<div id="ss-sync-result" class="mb-sm"></div>' +
+      '<div class="sync-action">' +
+        '<div><div class="sync-action__title">Sync Classes</div>' +
+          '<div class="sync-action__desc">Reads JSS/SSS class names from the external sheet and adds any that are missing to the Classes list.</div></div>' +
+        '<button class="btn btn--secondary" id="ss-sync-classes-btn" onclick="runSyncClasses()">' +
+          '<span class="btn-text">Sync</span><span class="spinner"></span></button>' +
+      '</div>' +
+      '<div class="sync-action">' +
+        '<div><div class="sync-action__title">Sync Subjects</div>' +
+          '<div class="sync-action__desc">Reads the Subjects Reference tab and creates class-subject assignments for the active session.</div></div>' +
+        '<button class="btn btn--secondary" id="ss-sync-subjects-btn" onclick="runSyncSubjects()">' +
+          '<span class="btn-text">Sync</span><span class="spinner"></span></button>' +
+      '</div>' +
+      '<div class="sync-action">' +
+        '<div><div class="sync-action__title">Refresh Student List</div>' +
+          '<div class="sync-action__desc">Updates the student cache for all classes from the external sheet. Run after new students are added or classes change.</div></div>' +
+        '<button class="btn btn--secondary" id="ss-refresh-students-btn" onclick="runRefreshStudents()">' +
+          '<span class="btn-text">Refresh</span><span class="spinner"></span></button>' +
+      '</div>' +
+    '</div>' +
+    '</div>'
+  );
+};
+
+function initSessionSettings() { /* Fields are pre-filled from App.settings — no async init needed */ }
+
+function saveSessionSettings() {
+  const session    = (document.getElementById('ss-session').value || '').trim();
+  const term       = document.getElementById('ss-term').value;
+  const startDate  = document.getElementById('ss-start').value;
+  const endDate    = document.getElementById('ss-end').value;
+  const fee        = (document.getElementById('ss-fee').value || '').trim();
+  const resumption = document.getElementById('ss-resumption').value;
+  clearAlert('ss-alert');
+  if (!session) { showAlert('ss-alert', 'Active Session is required (e.g. 2025/2026).', 'error'); return; }
+  const settings = { activeSession: session, activeTerm: term, termStartDate: startDate,
+    termEndDate: endDate, nextTermFee: fee, nextTermResumption: resumption };
+  setButtonLoading('ss-save-btn', true);
+  google.script.run
+    .withSuccessHandler(function (result) {
+      setButtonLoading('ss-save-btn', false);
+      if (handleSessionExpired(result)) return;
+      if (!result.success) { showAlert('ss-alert', result.error, 'error'); return; }
+      App.settings = result.data;
+      showToast('Session settings saved.', 'success');
+    })
+    .withFailureHandler(function () {
+      setButtonLoading('ss-save-btn', false);
+      showAlert('ss-alert', 'Connection error. Please try again.', 'error');
+    })
+    .serverSetSessionSettings(App.token, settings);
+}
+
+function saveExternalSheetId() {
+  const extId = (document.getElementById('ss-extid').value || '').trim();
+  if (!extId) { showToast('Please enter the External Sheet ID first.', 'error'); return; }
+  setButtonLoading('ss-extid-save-btn', true);
+  google.script.run
+    .withSuccessHandler(function (result) {
+      setButtonLoading('ss-extid-save-btn', false);
+      if (handleSessionExpired(result)) return;
+      if (!result.success) { showToast(result.error, 'error'); return; }
+      App.settings = result.data;
+      showToast('External Sheet ID saved.', 'success');
+    })
+    .withFailureHandler(function () {
+      setButtonLoading('ss-extid-save-btn', false);
+      showToast('Connection error. Please try again.', 'error');
+    })
+    .serverSetSessionSettings(App.token, { externalSheetId: extId });
+}
+
+function runSyncClasses() {
+  const extId = (App.settings && App.settings.externalSheetId) ||
+                (document.getElementById('ss-extid') ? document.getElementById('ss-extid').value.trim() : '');
+  if (!extId) { showAlert('ss-sync-result', 'Please save the External Sheet ID first.', 'error'); return; }
+  clearAlert('ss-sync-result');
+  setButtonLoading('ss-sync-classes-btn', true);
+  google.script.run
+    .withSuccessHandler(function (result) {
+      setButtonLoading('ss-sync-classes-btn', false);
+      if (handleSessionExpired(result)) return;
+      if (!result.success) { showAlert('ss-sync-result', result.error, 'error'); return; }
+      showAlert('ss-sync-result', result.data.message, 'success');
+    })
+    .withFailureHandler(function () {
+      setButtonLoading('ss-sync-classes-btn', false);
+      showAlert('ss-sync-result', 'Sync failed. Please try again.', 'error');
+    })
+    .serverSyncClasses(App.token, extId);
+}
+
+function runSyncSubjects() {
+  clearAlert('ss-sync-result');
+  if (!App.settings || !App.settings.activeSession) {
+    showAlert('ss-sync-result', 'Please save the active session first.', 'error'); return;
+  }
+  setButtonLoading('ss-sync-subjects-btn', true);
+  google.script.run
+    .withSuccessHandler(function (result) {
+      setButtonLoading('ss-sync-subjects-btn', false);
+      if (handleSessionExpired(result)) return;
+      if (!result.success) { showAlert('ss-sync-result', result.error, 'error'); return; }
+      showAlert('ss-sync-result', result.data.message, 'success');
+    })
+    .withFailureHandler(function () {
+      setButtonLoading('ss-sync-subjects-btn', false);
+      showAlert('ss-sync-result', 'Sync failed. Please try again.', 'error');
+    })
+    .serverSyncSubjects(App.token);
+}
+
+function runRefreshStudents() {
+  clearAlert('ss-sync-result');
+  setButtonLoading('ss-refresh-students-btn', true);
+  google.script.run
+    .withSuccessHandler(function (result) {
+      setButtonLoading('ss-refresh-students-btn', false);
+      if (handleSessionExpired(result)) return;
+      if (!result.success) { showAlert('ss-sync-result', result.error, 'error'); return; }
+      showAlert('ss-sync-result', result.data.message, 'success');
+    })
+    .withFailureHandler(function () {
+      setButtonLoading('ss-refresh-students-btn', false);
+      showAlert('ss-sync-result', 'Refresh failed. Please try again.', 'error');
+    })
+    .serverRefreshStudentCache(App.token, 'all');
+}
+
+// ─── CLASSES & SUBJECTS ───────────────────────────────────────────────────────
+
+Views.classesSubjects = function () {
+  return (
+    appBarHtml('Classes & Subjects', 'Synced data', true, 'adminHome') +
+    '<div class="tab-bar">' +
+      '<button class="tab-bar__tab tab-bar__tab--active" id="tab-classes" onclick="switchCSTab(\'classes\')">Classes</button>' +
+      '<button class="tab-bar__tab" id="tab-subjects" onclick="switchCSTab(\'subjects\')">Subjects</button>' +
+    '</div>' +
+    '<div id="cs-body"><div class="empty-state mt-lg">' +
+      '<div class="spinner spinner--blue" style="width:32px;height:32px;border-width:4px;margin:0 auto"></div>' +
+      '<p class="mt-md text-muted">Loading…</p></div></div>'
+  );
+};
+
+let _csClasses  = [];
+let _csSubjects = [];
+let _csActiveTab = 'classes';
+
+function initClassesSubjects() {
+  _csActiveTab = 'classes';
+  loadClassesAndSubjects();
+}
+
+function loadClassesAndSubjects() {
+  const body = document.getElementById('cs-body');
+  if (body) body.innerHTML =
+    '<div class="empty-state mt-lg"><div class="spinner spinner--blue" style="width:32px;height:32px;border-width:4px;margin:0 auto"></div>' +
+    '<p class="mt-md text-muted">Loading…</p></div>';
+  google.script.run
+    .withSuccessHandler(function (r1) {
+      if (handleSessionExpired(r1)) return;
+      _csClasses = (r1.success && r1.data) ? r1.data : [];
+      google.script.run
+        .withSuccessHandler(function (r2) {
+          if (handleSessionExpired(r2)) return;
+          _csSubjects = (r2.success && r2.data) ? r2.data : [];
+          renderCSTab(_csActiveTab);
+        })
+        .withFailureHandler(function () { _csSubjects = []; renderCSTab(_csActiveTab); })
+        .serverGetSubjects(App.token);
+    })
+    .withFailureHandler(function () { _csClasses = []; renderCSTab(_csActiveTab); })
+    .serverGetClasses(App.token);
+}
+
+function switchCSTab(tab) {
+  _csActiveTab = tab;
+  document.querySelectorAll('.tab-bar__tab').forEach(function (el) {
+    el.classList.toggle('tab-bar__tab--active', el.id === 'tab-' + tab);
+  });
+  renderCSTab(tab);
+}
+
+function renderCSTab(tab) {
+  const body = document.getElementById('cs-body');
+  if (!body) return;
+  if (tab === 'classes') {
+    if (_csClasses.length === 0) {
+      body.innerHTML = '<div class="empty-state mt-lg"><div class="empty-state__icon">🏫</div>' +
+        '<h3>No Classes Yet</h3><p>Go to Session Settings and tap <strong>Sync Classes</strong> to import them.</p></div>';
+      return;
+    }
+    const jss = _csClasses.filter(function (c) { return c.section === 'JSS'; });
+    const sss = _csClasses.filter(function (c) { return c.section === 'SSS'; });
+    let html = '';
+    if (jss.length > 0) {
+      html += '<div class="section-header">JSS (' + jss.length + ')</div><div class="card" style="margin:0;border-radius:0">';
+      jss.forEach(function (c) {
+        html += '<div class="list-row list-row--no-action"><span class="list-row__name">' + escHtml(c.className) + '</span>' +
+          '<span class="badge badge--teacher">' + escHtml(c.classId) + '</span></div>';
+      });
+      html += '</div>';
+    }
+    if (sss.length > 0) {
+      html += '<div class="section-header">SSS (' + sss.length + ')</div><div class="card" style="margin:0;border-radius:0">';
+      sss.forEach(function (c) {
+        const dept = c.department !== 'N/A' ? ' <span class="badge badge--on-leave">' + escHtml(c.department) + '</span>' : '';
+        html += '<div class="list-row list-row--no-action"><span class="list-row__name">' + escHtml(c.className) + dept + '</span>' +
+          '<span class="badge badge--teacher">' + escHtml(c.classId) + '</span></div>';
+      });
+      html += '</div>';
+    }
+    body.innerHTML = html;
+  } else {
+    if (_csSubjects.length === 0) {
+      body.innerHTML = '<div class="empty-state mt-lg"><div class="empty-state__icon">📚</div>' +
+        '<h3>No Subjects Yet</h3><p>Go to Session Settings and tap <strong>Sync Subjects</strong> after syncing classes.</p></div>';
+      return;
+    }
+    const jssS = _csSubjects.filter(function (s) { return s.section === 'JSS'; });
+    const sssS = _csSubjects.filter(function (s) { return s.section === 'SSS'; });
+    let html = '';
+    if (jssS.length > 0) {
+      html += '<div class="section-header">JSS Subjects (' + jssS.length + ')</div><div class="card" style="margin:0;border-radius:0">';
+      jssS.forEach(function (s) {
+        html += '<div class="list-row list-row--no-action"><span class="list-row__name">' + escHtml(s.subjectName) + '</span>' +
+          '<span class="badge badge--teacher">' + escHtml(s.subjectId) + '</span></div>';
+      });
+      html += '</div>';
+    }
+    if (sssS.length > 0) {
+      html += '<div class="section-header">SSS Subjects (' + sssS.length + ')</div><div class="card" style="margin:0;border-radius:0">';
+      sssS.forEach(function (s) {
+        html += '<div class="list-row list-row--no-action"><span class="list-row__name">' + escHtml(s.subjectName) + '</span>' +
+          '<span class="badge badge--on-leave">' + escHtml(s.department) + '</span></div>';
+      });
+      html += '</div>';
+    }
+    body.innerHTML = html;
+  }
+}
+
+// ─── MANAGE ASSIGNMENTS ───────────────────────────────────────────────────────
+
+Views.assignments = function () {
+  return (
+    appBarHtml('Manage Assignments', 'Form Masters & Teachers', true, 'adminHome') +
+    '<div class="tab-bar">' +
+      '<button class="tab-bar__tab tab-bar__tab--active" id="tab-fm" onclick="switchAssignTab(\'fm\')">Form Masters</button>' +
+      '<button class="tab-bar__tab" id="tab-ts" onclick="switchAssignTab(\'ts\')">Teacher Subjects</button>' +
+    '</div>' +
+    '<div id="assign-body"><div class="empty-state mt-lg">' +
+      '<div class="spinner spinner--blue" style="width:32px;height:32px;border-width:4px;margin:0 auto"></div>' +
+      '<p class="mt-md text-muted">Loading…</p></div></div>'
+  );
+};
+
+let _assignFM       = [];
+let _assignTS       = [];
+let _assignClasses  = [];
+let _assignSubjects = [];
+let _assignUsers    = [];
+let _assignActiveTab = 'fm';
+let _fmGroups       = {};
+let _assignCSA      = [];
+let _tsClassGroups  = {};
+
+function initAssignments() { _assignActiveTab = 'fm'; loadAssignmentData(); }
+
+function loadAssignmentData() {
+  setAssignBodyLoading();
+  google.script.run
+    .withSuccessHandler(function (r) {
+      if (handleSessionExpired(r)) return;
+      _assignClasses = (r.success && r.data) ? r.data : [];
+      google.script.run
+        .withSuccessHandler(function (r2) {
+          if (handleSessionExpired(r2)) return;
+          _assignSubjects = (r2.success && r2.data) ? r2.data : [];
+          google.script.run
+            .withSuccessHandler(function (r3) {
+              if (handleSessionExpired(r3)) return;
+              _assignUsers = (r3.success && r3.data) ? r3.data : [];
+              loadFMAssignments();
+            })
+            .withFailureHandler(function () { _assignUsers = []; loadFMAssignments(); })
+            .serverGetUserList(App.token);
+        })
+        .withFailureHandler(function () { _assignSubjects = []; loadFMAssignments(); })
+        .serverGetSubjects(App.token);
+    })
+    .withFailureHandler(function () { _assignClasses = []; renderAssignTab(_assignActiveTab); })
+    .serverGetClasses(App.token);
+}
+
+function loadFMAssignments() {
+  google.script.run
+    .withSuccessHandler(function (r) {
+      if (handleSessionExpired(r)) return;
+      _assignFM = (r.success && r.data) ? r.data : [];
+      loadTSAssignments();
+    })
+    .withFailureHandler(function () { _assignFM = []; loadTSAssignments(); })
+    .serverGetFormMasterAssignments(App.token);
+}
+
+function loadTSAssignments() {
+  google.script.run
+    .withSuccessHandler(function (r) {
+      if (handleSessionExpired(r)) return;
+      _assignTS = (r.success && r.data) ? r.data : [];
+      loadCSAssignments();
+    })
+    .withFailureHandler(function () { _assignTS = []; loadCSAssignments(); })
+    .serverGetTeacherAssignments(App.token);
+}
+
+function loadCSAssignments() {
+  const sessionFilter = (App.settings || {}).activeSession || null;
+  google.script.run
+    .withSuccessHandler(function (r) {
+      if (handleSessionExpired(r)) return;
+      _assignCSA = (r.success && r.data) ? r.data : [];
+      renderAssignTab(_assignActiveTab);
+    })
+    .withFailureHandler(function () { _assignCSA = []; renderAssignTab(_assignActiveTab); })
+    .serverGetClassSubjectAssignments(App.token, sessionFilter);
+}
+
+function setAssignBodyLoading() {
+  const body = document.getElementById('assign-body');
+  if (body) body.innerHTML = '<div class="empty-state mt-lg">' +
+    '<div class="spinner spinner--blue" style="width:32px;height:32px;border-width:4px;margin:0 auto"></div>' +
+    '<p class="mt-md text-muted">Loading…</p></div>';
+}
+
+function switchAssignTab(tab) {
+  _assignActiveTab = tab;
+  document.querySelectorAll('.tab-bar__tab').forEach(function (el) {
+    el.classList.toggle('tab-bar__tab--active', el.id === 'tab-' + tab);
+  });
+  renderAssignTab(tab);
+}
+
+function renderAssignTab(tab) {
+  const body = document.getElementById('assign-body');
+  if (!body) return;
+  if (_assignClasses.length === 0) {
+    body.innerHTML = '<div class="page-content"><div class="alert alert--info">' +
+      'No classes found. Go to Session Settings and run Sync Classes first.</div></div>';
+    return;
+  }
+  if (tab === 'fm') renderFMTab(body);
+  else renderTSTab(body);
+}
+
+// ─── FM GROUP HELPERS ─────────────────────────────────────────────────────────
+
+function getFMGroupKey(className) {
+  return className.replace(/\s+(science|art|commerce|humanities|business)\s*$/i, '').trim();
+}
+
+function buildFMGroups() {
+  const ORDER = ['JSS 1', 'JSS 2', 'JSS 3', 'SSS 1', 'SSS 2', 'SSS 3'];
+  const map = {};
+  _assignClasses.forEach(function (cls) {
+    const key = getFMGroupKey(cls.className);
+    if (!map[key]) map[key] = { label: key, classIds: [], classNames: [] };
+    map[key].classIds.push(cls.classId);
+    map[key].classNames.push(cls.className);
+  });
+  _fmGroups = map;
+  return Object.keys(map).sort(function (a, b) {
+    const ai = ORDER.indexOf(a), bi = ORDER.indexOf(b);
+    if (ai !== -1 && bi !== -1) return ai - bi;
+    if (ai !== -1) return -1;
+    if (bi !== -1) return 1;
+    return a.localeCompare(b);
+  }).map(function (k) { return map[k]; });
+}
+
+function fmDomKey(label) { return label.replace(/\s+/g, '_'); }
+
+// ─── FORM MASTER TAB ─────────────────────────────────────────────────────────
+
+function renderFMTab(body) {
+  const groups = buildFMGroups();
+  const fmByClass = {};
+  _assignFM.forEach(function (a) { fmByClass[a.classId] = a; });
+  const teachers = _assignUsers.filter(function (u) {
+    return u.employmentStatus === 'Active' && (u.role === 'Teacher' || u.role === 'Admin');
+  });
+  let html = '<div class="page-content">';
+  html += '<p class="text-sm text-muted mb-md">Assign one Form Master per level for the active session (' +
+    escHtml((App.settings || {}).activeSession || 'not set') + '). For SSS levels the same Form Master covers all departments.</p>';
+  html += '<div id="fm-alert" class="mb-md"></div>';
+  groups.forEach(function (group) {
+    const dk = fmDomKey(group.label);
+    let existing = null;
+    for (let i = 0; i < group.classIds.length; i++) {
+      if (fmByClass[group.classIds[i]]) { existing = fmByClass[group.classIds[i]]; break; }
+    }
+    const selectedStaffId = existing ? existing.staffId : '';
+    const fullAccess = existing ? (existing.grantedFullAccess === 'TRUE' || existing.grantedFullAccess === true) : false;
+    const options = '<option value="">— Select teacher —</option>' +
+      teachers.map(function (u) {
+        return '<option value="' + escHtml(u.staffId) + '"' +
+          (u.staffId === selectedStaffId ? ' selected' : '') + '>' +
+          escHtml(u.name) + ' (' + escHtml(u.staffId) + ')</option>';
+      }).join('');
+    const subLabel = group.classNames.length > 1
+      ? '<div class="text-xs text-muted mt-xs">Covers: ' + group.classNames.join(' · ') + '</div>' : '';
+    html +=
+      '<div class="assign-card" id="fm-card-' + dk + '">' +
+        '<div class="assign-card__class">' +
+          '<div class="assign-card__class-name">' + escHtml(group.label) + '</div>' + subLabel +
+        '</div>' +
+        '<div class="assign-card__body">' +
+          '<select class="form-select mb-sm" id="fm-staff-' + dk + '">' + options + '</select>' +
+          '<label class="d-flex align-center gap-sm mb-sm" style="cursor:pointer">' +
+            '<input type="checkbox" id="fm-full-' + dk + '"' + (fullAccess ? ' checked' : '') + '>' +
+            '<span class="text-sm">Grant full-class score entry access</span>' +
+          '</label>' +
+          '<div class="d-flex gap-sm">' +
+            '<button class="btn btn--secondary btn--sm" onclick="saveFormMaster(\'' + dk + '\')">' +
+              (existing ? 'Update' : 'Assign') + '</button>' +
+            (existing ? '<button class="btn btn--ghost btn--sm" onclick="removeFormMaster(\'' + dk + '\')">Remove</button>' : '') +
+          '</div>' +
+        '</div>' +
+      '</div>';
+  });
+  html += '</div>';
+  body.innerHTML = html;
+}
+
+function saveFormMaster(domKey) {
+  clearAlert('fm-alert');
+  const groupLabel = domKey.replace(/_/g, ' ');
+  const group = _fmGroups[groupLabel];
+  if (!group) return;
+  const staffEl = document.getElementById('fm-staff-' + domKey);
+  const fullEl  = document.getElementById('fm-full-' + domKey);
+  if (!staffEl) return;
+  const staffId           = staffEl.value;
+  const grantedFullAccess = fullEl ? fullEl.checked : false;
+  if (!staffId) { showAlert('fm-alert', 'Please select a teacher to assign as Form Master.', 'error'); return; }
+  const classIds = group.classIds.slice();
+  let idx = 0;
+  function assignNext() {
+    if (idx >= classIds.length) {
+      showToast('Form Master assigned for ' + groupLabel + '.', 'success');
+      google.script.run
+        .withSuccessHandler(function (r) {
+          if (handleSessionExpired(r)) return;
+          _assignFM = (r.success && r.data) ? r.data : [];
+          renderAssignTab('fm');
+        })
+        .serverGetFormMasterAssignments(App.token);
+      return;
+    }
+    const classId = classIds[idx++];
+    google.script.run
+      .withSuccessHandler(function (result) {
+        if (handleSessionExpired(result)) return;
+        if (!result.success) { showAlert('fm-alert', result.error, 'error'); return; }
+        assignNext();
+      })
+      .withFailureHandler(function () { showAlert('fm-alert', 'Connection error.', 'error'); })
+      .serverSetFormMasterAssignment(App.token, { staffId: staffId, classId: classId, grantedFullAccess: grantedFullAccess });
+  }
+  assignNext();
+}
+
+function removeFormMaster(domKey) {
+  const groupLabel = domKey.replace(/_/g, ' ');
+  const group = _fmGroups[groupLabel];
+  if (!group) return;
+  if (!confirm('Remove the Form Master assignment for ' + groupLabel + '?')) return;
+  const classIds = group.classIds.slice();
+  let idx = 0;
+  function removeNext() {
+    if (idx >= classIds.length) {
+      showToast('Form Master assignment removed.', 'success');
+      google.script.run
+        .withSuccessHandler(function (r) {
+          if (handleSessionExpired(r)) return;
+          _assignFM = (r.success && r.data) ? r.data : [];
+          renderAssignTab('fm');
+        })
+        .serverGetFormMasterAssignments(App.token);
+      return;
+    }
+    const classId = classIds[idx++];
+    google.script.run
+      .withSuccessHandler(function (r) {
+        if (handleSessionExpired(r)) return;
+        removeNext();
+      })
+      .withFailureHandler(function () { showToast('Connection error.', 'error'); })
+      .serverRemoveFormMasterAssignment(App.token, classId);
+  }
+  removeNext();
+}
+
+// ─── TEACHER SUBJECT TAB ──────────────────────────────────────────────────────
+
+function renderTSTab(body) {
+  const settings  = App.settings || {};
+  const teachers  = _assignUsers.filter(function (u) {
+    return u.employmentStatus === 'Active' && (u.role === 'Teacher' || u.role === 'Admin');
+  });
+  const teacherOpts = '<option value="">— Select teacher —</option>' +
+    teachers.map(function (u) {
+      return '<option value="' + escHtml(u.staffId) + '">' + escHtml(u.name) + ' (' + escHtml(u.staffId) + ')</option>';
+    }).join('');
+  const subjectOpts = '<option value="">— Select subject —</option>' +
+    _assignSubjects.map(function (s) {
+      return '<option value="' + escHtml(s.subjectId) + '">' + escHtml(s.subjectName) + ' (' + escHtml(s.section) + ')</option>';
+    }).join('');
+  const termOpts = ['First Term', 'Second Term', 'Third Term'].map(function (t) {
+    return '<option value="' + t + '"' + (settings.activeTerm === t ? ' selected' : '') + '>' + t + '</option>';
+  }).join('');
+  let html = '<div class="page-content">';
+  html += '<p class="text-sm text-muted mb-md">Session: <strong>' + escHtml(settings.activeSession || 'not set') +
+    '</strong> · Term: <strong>' + escHtml(settings.activeTerm || 'not set') + '</strong></p>';
+  html += '<div id="ts-alert" class="mb-md"></div>';
+  html +=
+    '<div class="card card--pad mb-md">' +
+      '<div class="section-header-inline mb-sm">Add Assignment</div>' +
+      '<div class="form-group"><label class="form-label" for="ts-staff">Teacher</label>' +
+        '<select class="form-select" id="ts-staff">' + teacherOpts + '</select></div>' +
+      '<div class="form-group"><label class="form-label" for="ts-subject">Subject</label>' +
+        '<select class="form-select" id="ts-subject" onchange="onTSSubjectChange()">' + subjectOpts + '</select></div>' +
+      '<div class="form-group"><label class="form-label" for="ts-term">Term</label>' +
+        '<select class="form-select" id="ts-term" onchange="onTSSubjectChange()">' + termOpts + '</select></div>' +
+      '<div class="form-group"><label class="form-label">Classes</label>' +
+        '<div id="ts-class-list" class="check-list">' +
+          '<div class="check-list__empty">Select a subject above to see available classes.</div>' +
+        '</div>' +
+        '<div class="form-hint">Only classes that offer the selected subject are shown.</div>' +
+      '</div>' +
+      '<button class="btn btn--primary btn--sm mt-xs" id="ts-add-btn" onclick="addTeacherAssignment()">' +
+        '<span class="btn-text">Add Assignment</span><span class="spinner"></span></button>' +
+    '</div>';
+  // Deduplicate by staffId + subjectId + class-group + term
+  const _tsSeen = {}, _tsDisplay = [];
+  _assignTS.forEach(function (a) {
+    const groupKey = getFMGroupKey(a.className || '');
+    const key = (a.staffId||'') + '|' + (a.subjectId||'') + '|' + groupKey + '|' + (a.term||'');
+    if (!_tsSeen[key]) {
+      _tsSeen[key] = { staffName: a.staffName||a.staffId, subjectName: a.subjectName||a.subjectId,
+        classGroup: groupKey||(a.className||a.classId), term: a.term||'', assignmentIds: [a.assignmentId] };
+      _tsDisplay.push(_tsSeen[key]);
+    } else { _tsSeen[key].assignmentIds.push(a.assignmentId); }
+  });
+  if (_tsDisplay.length === 0) {
+    html += '<div class="empty-state mt-sm"><div class="empty-state__icon">📋</div>' +
+      '<h3>No Assignments Yet</h3><p>Use the form above to assign teachers to subjects.</p></div>';
+  } else {
+    html += '<div class="section-header">Current Assignments (' + _tsDisplay.length + ')</div>' +
+      '<div class="card" style="margin:0;border-radius:0">';
+    _tsDisplay.forEach(function (entry) {
+      const idsJson = escHtml(JSON.stringify(entry.assignmentIds));
+      html += '<div class="list-row list-row--no-action"><div class="list-row__info">' +
+        '<div class="list-row__name">' + escHtml(entry.staffName) + '</div>' +
+        '<div class="list-row__sub">' + escHtml(entry.classGroup) + ' · ' + escHtml(entry.subjectName) +
+          (entry.term ? ' <span class="text-muted">(' + escHtml(entry.term) + ')</span>' : '') + '</div>' +
+        '</div><button class="btn btn--ghost btn--sm" onclick="removeTeacherAssignmentGroup(' + idsJson + ')">Remove</button></div>';
+    });
+    html += '</div>';
+  }
+  html += '</div>';
+  body.innerHTML = html;
+}
+
+function onTSSubjectChange() {
+  const subjectId    = document.getElementById('ts-subject') ? document.getElementById('ts-subject').value : '';
+  const selectedTerm = document.getElementById('ts-term')    ? document.getElementById('ts-term').value    : '';
+  const listEl = document.getElementById('ts-class-list');
+  if (!listEl) return;
+  _tsClassGroups = {};
+  if (!subjectId) { listEl.innerHTML = '<div class="check-list__empty">Select a subject above to see available classes.</div>'; return; }
+  const csaClassIds = new Set(_assignCSA.filter(function (csa) { return csa.subjectId === subjectId; }).map(function (csa) { return csa.classId; }));
+  if (csaClassIds.size === 0) { listEl.innerHTML = '<div class="check-list__empty">No classes are assigned this subject. Run Sync Subjects first.</div>'; return; }
+  const ORDER = ['JSS 1', 'JSS 2', 'JSS 3', 'SSS 1', 'SSS 2', 'SSS 3'];
+  const groupMap = {};
+  _assignClasses.filter(function (c) { return csaClassIds.has(c.classId); }).forEach(function (c) {
+    const key = getFMGroupKey(c.className);
+    if (!groupMap[key]) groupMap[key] = [];
+    groupMap[key].push(c.classId);
+  });
+  _tsClassGroups = groupMap;
+  const classToGroup = {};
+  Object.keys(groupMap).forEach(function (gk) { groupMap[gk].forEach(function (cid) { classToGroup[cid] = gk; }); });
+  const takenGroupMap = {};
+  _assignTS.filter(function (a) { return a.subjectId === subjectId && (!selectedTerm || a.term === selectedTerm); })
+    .forEach(function (a) { const gk = classToGroup[a.classId]; if (gk && !takenGroupMap[gk]) takenGroupMap[gk] = a; });
+  const groupKeys = Object.keys(groupMap).sort(function (a, b) {
+    const ai = ORDER.indexOf(a), bi = ORDER.indexOf(b);
+    if (ai !== -1 && bi !== -1) return ai - bi;
+    if (ai !== -1) return -1; if (bi !== -1) return 1;
+    return a.localeCompare(b);
+  });
+  const availableCount = groupKeys.filter(function (k) { return !takenGroupMap[k]; }).length;
+  const takenCount     = groupKeys.length - availableCount;
+  let selectAllLabel = 'Select all available';
+  if (availableCount > 0) selectAllLabel += ' (' + availableCount + ')';
+  if (takenCount > 0)     selectAllLabel += ' · ' + takenCount + ' already assigned';
+  let html = '<label class="check-list__item check-list__item--all">' +
+    '<input type="checkbox" id="ts-select-all" onchange="toggleTSSelectAll(this.checked)"' + (availableCount === 0 ? ' disabled' : '') + '>' +
+    '<span class="text-sm fw-bold">' + selectAllLabel + '</span></label>';
+  groupKeys.forEach(function (key) {
+    const taken = takenGroupMap[key];
+    if (taken) {
+      html += '<label class="check-list__item check-list__item--taken"><input type="checkbox" disabled>' +
+        '<span class="text-sm">' + escHtml(key) + '</span>' +
+        '<span class="check-list__taken-label">' + escHtml(taken.staffName||taken.staffId) + '</span></label>';
+    } else {
+      html += '<label class="check-list__item"><input type="checkbox" class="ts-cls-check" value="' + escHtml(key) + '">' +
+        '<span class="text-sm">' + escHtml(key) + '</span></label>';
+    }
+  });
+  listEl.innerHTML = html;
+}
+
+function toggleTSSelectAll(checked) {
+  document.querySelectorAll('.ts-cls-check').forEach(function (el) { el.checked = checked; });
+}
+
+function addTeacherAssignment() {
+  clearAlert('ts-alert');
+  const staffId   = document.getElementById('ts-staff')   ? document.getElementById('ts-staff').value   : '';
+  const subjectId = document.getElementById('ts-subject') ? document.getElementById('ts-subject').value : '';
+  const term      = document.getElementById('ts-term')    ? document.getElementById('ts-term').value    : '';
+  if (!staffId || !subjectId || !term) { showAlert('ts-alert', 'Please select Teacher, Subject and Term.', 'error'); return; }
+  const checkedEls        = document.querySelectorAll('.ts-cls-check:checked');
+  const selectedGroupKeys = Array.from(checkedEls).map(function (el) { return el.value; });
+  if (selectedGroupKeys.length === 0) { showAlert('ts-alert', 'Please select at least one class.', 'error'); return; }
+  const selectedClassIds = [];
+  selectedGroupKeys.forEach(function (key) {
+    (_tsClassGroups[key] || []).forEach(function (cid) { selectedClassIds.push(cid); });
+  });
+  if (selectedClassIds.length === 0) { showAlert('ts-alert', 'No class IDs found. Try reloading.', 'error'); return; }
+  setButtonLoading('ts-add-btn', true);
+  let added = 0, skipped = 0, idx = 0;
+  function assignNext() {
+    if (idx >= selectedClassIds.length) {
+      setButtonLoading('ts-add-btn', false);
+      if (added > 0) {
+        const skipNote = skipped > 0 ? ' (' + skipped + ' already existed, skipped).' : '.';
+        showToast(added + ' assignment' + (added !== 1 ? 's' : '') + ' added' + skipNote, 'success');
+      } else {
+        showAlert('ts-alert', 'All selected assignments already exist for this term.', 'warning');
+      }
+      google.script.run
+        .withSuccessHandler(function (r) {
+          if (handleSessionExpired(r)) return;
+          _assignTS = (r.success && r.data) ? r.data : [];
+          renderAssignTab('ts');
+        })
+        .serverGetTeacherAssignments(App.token);
+      return;
+    }
+    const classId = selectedClassIds[idx++];
+    google.script.run
+      .withSuccessHandler(function (result) {
+        if (handleSessionExpired(result)) return;
+        if (!result.success) {
+          if (result.code === 'DUPLICATE') { skipped++; assignNext(); }
+          else { setButtonLoading('ts-add-btn', false); showAlert('ts-alert', result.error, 'error'); }
+        } else { added++; assignNext(); }
+      })
+      .withFailureHandler(function () {
+        setButtonLoading('ts-add-btn', false);
+        showAlert('ts-alert', 'Connection error. Please try again.', 'error');
+      })
+      .serverAddTeacherAssignment(App.token, { staffId: staffId, classId: classId, subjectId: subjectId, term: term });
+  }
+  assignNext();
+}
+
+function removeTeacherAssignmentGroup(assignmentIds) {
+  if (!confirm('Remove this assignment?')) return;
+  const ids = Array.isArray(assignmentIds) ? assignmentIds.slice() : [assignmentIds];
+  let idx = 0;
+  function removeNext() {
+    if (idx >= ids.length) {
+      showToast('Assignment removed.', 'success');
+      google.script.run
+        .withSuccessHandler(function (r) {
+          if (handleSessionExpired(r)) return;
+          _assignTS = (r.success && r.data) ? r.data : [];
+          renderAssignTab('ts');
+        })
+        .withFailureHandler(function () { renderAssignTab('ts'); })
+        .serverGetTeacherAssignments(App.token);
+      return;
+    }
+    const id = ids[idx++];
+    google.script.run
+      .withSuccessHandler(function (result) {
+        if (handleSessionExpired(result)) return;
+        if (!result.success) { showToast(result.error || 'Remove failed.', 'error'); return; }
+        removeNext();
+      })
+      .withFailureHandler(function () { showToast('Connection error.', 'error'); })
+      .serverRemoveTeacherAssignment(App.token, id);
+  }
+  removeNext();
+}
+
+// ─── USER LIST ────────────────────────────────────────────────────────────────
+
+Views.userList = function () {
+  return (
+    appBarHtml('User List', 'Staff accounts', true, 'adminHome') +
+    '<div class="search-bar">' +
+      '<input type="text" id="user-search" placeholder="Search by name or username…" oninput="filterUsers()">' +
+    '</div>' +
+    '<div id="user-list-body"><div class="empty-state mt-lg">' +
+      '<div class="spinner spinner--blue" style="width:32px;height:32px;border-width:4px;margin:0 auto"></div>' +
+      '<p class="mt-md text-muted">Loading users…</p></div></div>' +
+    '<button class="fab" onclick="renderView(\'addUser\')" aria-label="Add user" title="Add User">+</button>'
+  );
+};
+
+let _userListData = [];
+
+function initUserList() {
+  google.script.run
+    .withSuccessHandler(function (result) {
+      if (handleSessionExpired(result)) return;
+      const body = document.getElementById('user-list-body');
+      if (!body) return;
+      if (!result || !result.success) {
+        body.innerHTML = '<div class="page-content"><div class="alert alert--error">' +
+          escHtml((result && result.error) || 'Could not load users.') + '</div></div>';
+        return;
+      }
+      _userListData = result.data || [];
+      renderUserList(_userListData);
+    })
+    .withFailureHandler(function (err) {
+      const body = document.getElementById('user-list-body');
+      if (body) body.innerHTML = '<div class="page-content"><div class="alert alert--error">' +
+        'Failed to load users: ' + escHtml((err && err.message) || 'Server error.') + '</div></div>';
+    })
+    .serverGetUserList(App.token);
+}
+
+function renderUserList(users) {
+  const body = document.getElementById('user-list-body');
+  if (!body) return;
+  if (!users || users.length === 0) {
+    body.innerHTML = '<div class="page-content"><div class="empty-state mt-lg"><div class="empty-state__icon">👤</div>' +
+      '<h3>No Users Found</h3><p>Tap the + button to add the first staff account.</p></div></div>';
+    return;
+  }
+  const groups = [
+    { label: 'Super Admin', users: users.filter(function (u) { return u.role === 'Super Admin'; }) },
+    { label: 'Admin',       users: users.filter(function (u) { return u.role === 'Admin'; })       },
+    { label: 'Teachers',    users: users.filter(function (u) { return u.role === 'Teacher'; })     }
+  ].filter(function (g) { return g.users.length > 0; });
+  let html = '';
+  groups.forEach(function (group) {
+    html += '<div class="section-header">' + escHtml(group.label) + ' (' + group.users.length + ')</div>' +
+      '<div class="card" style="margin:0;border-radius:0">';
+    group.users.forEach(function (user) {
+      const statusCls = user.employmentStatus === 'Resigned' ? ' style="opacity:.55"' : '';
+      html += '<div class="list-row" onclick="openUserProfile(\'' + escHtml(user.staffId) + '\')"' + statusCls + '>' +
+        '<div class="list-row__avatar">' + escHtml(initials(user.name)) + '</div>' +
+        '<div class="list-row__info"><div class="list-row__name">' + escHtml(user.name) + '</div>' +
+          '<div class="list-row__sub">' + escHtml(user.username) + ' · ' + escHtml(user.staffId) +
+            (user.employmentStatus !== 'Active' ? ' · ' + escHtml(user.employmentStatus) : '') + '</div></div>' +
+        roleBadge(user.role) + '<span class="list-row__chevron">›</span></div>';
+    });
+    html += '</div>';
+  });
+  body.innerHTML = html;
+}
+
+function filterUsers() {
+  const query = (document.getElementById('user-search').value || '').toLowerCase();
+  if (!query) { renderUserList(_userListData); return; }
+  renderUserList(_userListData.filter(function (u) {
+    return (u.name||'').toLowerCase().includes(query) || (u.username||'').toLowerCase().includes(query) ||
+           (u.staffId||'').toLowerCase().includes(query) || (u.subjectSpecialty||'').toLowerCase().includes(query);
+  }));
+}
+
+function openUserProfile(staffId) { renderView('editUser', { staffId: staffId }); }
+
+// ─── ADD USER ─────────────────────────────────────────────────────────────────
+
+Views.addUser = function () {
+  const isSA = App.user && App.user.role === 'Super Admin';
+  return (
+    appBarHtml('Add User', 'New staff account', true, 'userList') +
+    '<div class="page-content"><div class="card card--pad">' +
+      '<div id="adduser-alert" class="mb-md"></div>' +
+      '<div class="form-group"><label class="form-label" for="au-name">Full Name *</label>' +
+        '<input class="form-input" type="text" id="au-name" autocomplete="off" placeholder="e.g. Chukwuemeka Obi">' +
+        '<div class="form-hint error hidden" id="au-name-hint"></div></div>' +
+      '<div class="form-group"><label class="form-label" for="au-username">Username *</label>' +
+        '<input class="form-input" type="text" id="au-username" autocomplete="off" autocapitalize="none" placeholder="e.g. cobi_teacher">' +
+        '<div class="form-hint" id="au-username-hint">3–20 characters: letters, numbers, underscores.</div></div>' +
+      '<div class="form-group"><label class="form-label" for="au-password">Temporary Password *</label>' +
+        '<div class="input-wrapper"><input class="form-input form-input--icon" type="text" id="au-password" autocomplete="off" placeholder="At least 8 characters">' +
+        '<button class="input-icon-btn" onclick="togglePwVisibility(\'au-password\',this)" type="button">👁</button></div>' +
+        '<div class="form-hint" id="au-password-hint">Visible — share directly with the staff member.</div></div>' +
+      '<div class="form-group"><label class="form-label" for="au-email">Email</label>' +
+        '<input class="form-input" type="email" id="au-email" autocomplete="off" placeholder="Optional"></div>' +
+      '<div class="form-group"><label class="form-label" for="au-phone">Phone Number</label>' +
+        '<input class="form-input" type="tel" id="au-phone" placeholder="Optional"></div>' +
+      '<div class="form-group"><label class="form-label" for="au-specialty">Subject Specialty</label>' +
+        '<input class="form-input" type="text" id="au-specialty" placeholder="e.g. Mathematics, Physics"></div>' +
+      '<div class="form-group"><label class="form-label" for="au-status">Employment Status</label>' +
+        '<select class="form-select" id="au-status"><option value="Active">Active</option><option value="On Leave">On Leave</option></select></div>' +
+      (isSA ? '<div class="form-group"><label class="form-label" for="au-role">Role</label>' +
+        '<select class="form-select" id="au-role"><option value="Teacher">Teacher</option><option value="Admin">Admin</option></select></div>' : '') +
+      '<button class="btn btn--primary btn--full mt-md" id="au-btn" onclick="submitAddUser()">' +
+        '<span class="btn-text">Create Account</span><span class="spinner"></span></button>' +
+    '</div></div>'
+  );
+};
+
+function initAddUser() {
+  const usernameInput = document.getElementById('au-username');
+  if (!usernameInput) return;
+  usernameInput.addEventListener('input', function () {
+    clearTimeout(App.usernameCheckTimer);
+    const val = this.value.trim();
+    if (!val) {
+      document.getElementById('au-username-hint').textContent = '3–20 characters: letters, numbers, underscores.';
+      document.getElementById('au-username-hint').className = 'form-hint';
+      clearFieldError('au-username'); return;
+    }
+    App.usernameCheckTimer = setTimeout(function () {
+      google.script.run
+        .withSuccessHandler(function (result) {
+          const hint = document.getElementById('au-username-hint');
+          if (!hint) return;
+          if (result.available) { hint.textContent = '✓ Username is available.'; hint.className = 'form-hint success'; clearFieldError('au-username'); }
+          else { hint.textContent = result.reason || 'Not available.'; hint.className = 'form-hint error'; }
+        })
+        .serverCheckUsername(val);
+    }, 400);
+  });
+}
+
+function submitAddUser() {
+  clearAlert('adduser-alert');
+  clearFieldError('au-name'); clearFieldError('au-username'); clearFieldError('au-password');
+  const name      = (document.getElementById('au-name').value || '').trim();
+  const username  = (document.getElementById('au-username').value || '').trim();
+  const password  = document.getElementById('au-password').value || '';
+  const email     = (document.getElementById('au-email')     ? document.getElementById('au-email').value.trim()     : '');
+  const phone     = (document.getElementById('au-phone')     ? document.getElementById('au-phone').value.trim()     : '');
+  const specialty = (document.getElementById('au-specialty') ? document.getElementById('au-specialty').value.trim() : '');
+  const status    = document.getElementById('au-status') ? document.getElementById('au-status').value : 'Active';
+  const roleEl    = document.getElementById('au-role');
+  const role      = roleEl ? roleEl.value : 'Teacher';
+  let valid = true;
+  if (!name)                     { showFieldError('au-name', 'Full name is required.'); valid = false; }
+  if (!username)                 { showFieldError('au-username', 'Username is required.'); valid = false; }
+  if (!password)                 { showFieldError('au-password', 'Temporary password is required.'); valid = false; }
+  if (password && password.length < 8) { showFieldError('au-password', 'Password must be at least 8 characters.'); valid = false; }
+  if (!valid) return;
+  setButtonLoading('au-btn', true);
+  google.script.run
+    .withSuccessHandler(function (result) {
+      setButtonLoading('au-btn', false);
+      if (handleSessionExpired(result)) return;
+      if (!result.success) {
+        showAlert('adduser-alert', result.error, 'error');
+        if (result.code === 'USERNAME_TAKEN') showFieldError('au-username', result.error);
+        return;
+      }
+      showToast(result.data.message, 'success');
+      renderView('userList');
+    })
+    .withFailureHandler(function () {
+      setButtonLoading('au-btn', false);
+      showAlert('adduser-alert', 'Connection error. Please try again.', 'error');
+    })
+    .serverAddUser(App.token, { name, username, password, email, phoneNumber: phone,
+      subjectSpecialty: specialty, employmentStatus: status, role });
+}
+
+// ─── EDIT USER ────────────────────────────────────────────────────────────────
+
+Views.editUser = function (params) {
+  return (
+    appBarHtml('User Profile', 'Loading…', true, 'userList') +
+    '<div class="page-content"><div id="edituser-body">' +
+      '<div class="empty-state mt-lg"><div class="spinner spinner--blue" style="width:32px;height:32px;border-width:4px;margin:0 auto"></div></div>' +
+    '</div></div>'
+  );
+};
+
+function initEditUser(params) {
+  const staffId = params && params.staffId;
+  if (!staffId) {
+    document.getElementById('edituser-body').innerHTML = '<div class="alert alert--error">No user selected.</div>'; return;
+  }
+  google.script.run
+    .withSuccessHandler(function (result) {
+      if (handleSessionExpired(result)) return;
+      if (!result.success) {
+        document.getElementById('edituser-body').innerHTML = '<div class="alert alert--error">' + escHtml(result.error) + '</div>'; return;
+      }
+      renderEditUserForm(result.data);
+    })
+    .withFailureHandler(function () {
+      document.getElementById('edituser-body').innerHTML = '<div class="alert alert--error">Failed to load user.</div>';
+    })
+    .serverGetUser(App.token, staffId);
+}
+
+function renderEditUserForm(user) {
+  const body = document.getElementById('edituser-body');
+  if (!body) return;
+  const h1 = document.querySelector('.app-bar h1');
+  if (h1) h1.textContent = user.name;
+  const subtitleEl = document.querySelector('.app-bar .subtitle');
+  if (subtitleEl) subtitleEl.textContent = user.role || 'Staff Profile';
+  const isSA       = App.user && App.user.role === 'Super Admin';
+  const isTargetSA = user.role === 'Super Admin';
+  const isSelf     = App.user && App.user.staffId === user.staffId;
+  const canEditRole = isSA && !isSelf && !isTargetSA;
+  const statusOptions = ['Active', 'On Leave', 'Resigned'].map(function (s) {
+    return '<option value="' + s + '"' + (user.employmentStatus === s ? ' selected' : '') + '>' + s + '</option>';
+  }).join('');
+  body.innerHTML =
+    '<div id="edituser-alert" class="mb-md"></div>' +
+    '<div class="card card--pad mb-md">' +
+      '<div class="d-flex align-center justify-between mb-sm">' +
+        '<div class="text-xs text-muted">' + escHtml(user.staffId) + ' · ' + escHtml(user.username) + '</div>' +
+        roleBadge(user.role) +
+      '</div>' +
+      '<div class="text-xs text-muted">Added by: ' + escHtml(user.addedBy || '—') + ' · Joined: ' + formatDate(user.dateJoined) + '</div>' +
+    '</div>' +
+    '<div class="card card--pad">' +
+      '<div class="form-group"><label class="form-label">Full Name</label>' +
+        '<input class="form-input" type="text" id="eu-name" value="' + escHtml(user.name) + '"></div>' +
+      '<div class="form-group"><label class="form-label">Email</label>' +
+        '<input class="form-input" type="email" id="eu-email" value="' + escHtml(user.email || '') + '"></div>' +
+      '<div class="form-group"><label class="form-label">Phone Number</label>' +
+        '<input class="form-input" type="tel" id="eu-phone" value="' + escHtml(user.phoneNumber || '') + '"></div>' +
+      '<div class="form-group"><label class="form-label">Subject Specialty</label>' +
+        '<input class="form-input" type="text" id="eu-specialty" value="' + escHtml(user.subjectSpecialty || '') + '"></div>' +
+      '<div class="form-group"><label class="form-label">Employment Status</label>' +
+        '<select class="form-select" id="eu-status">' + statusOptions + '</select></div>' +
+      '<button class="btn btn--primary btn--full mt-md" id="eu-save-btn" onclick="submitEditUser(\'' + escHtml(user.staffId) + '\')">' +
+        '<span class="btn-text">Save Changes</span><span class="spinner"></span></button>' +
+    '</div>' +
+    '<div class="card card--pad mt-md">' +
+      '<div class="fw-bold mb-sm">Reset Password</div>' +
+      '<p class="text-sm text-muted mb-md">Set a new temporary password. User will be forced to change it on next login.</p>' +
+      '<div class="form-group"><label class="form-label">New Temporary Password</label>' +
+        '<input class="form-input" type="text" id="eu-new-temp-pw" placeholder="At least 8 characters">' +
+        '<div class="form-hint" id="eu-new-temp-pw-hint">Visible — share directly with the staff member.</div></div>' +
+      '<button class="btn btn--secondary btn--full" id="eu-reset-pw-btn" onclick="submitResetPassword(\'' + escHtml(user.staffId) + '\')">' +
+        '<span class="btn-text">Reset Password</span><span class="spinner"></span></button>' +
+    '</div>' +
+    (canEditRole
+      ? '<div class="card card--pad mt-md"><div class="fw-bold mb-sm">Change Role</div><div class="d-flex gap-sm">' +
+          (user.role !== 'Admin'
+            ? '<button class="btn btn--secondary" onclick="submitChangeRole(\'' + escHtml(user.staffId) + '\', \'Admin\')">Promote to Admin</button>'
+            : '<button class="btn btn--secondary" onclick="submitChangeRole(\'' + escHtml(user.staffId) + '\', \'Teacher\')">Demote to Teacher</button>') +
+        '</div></div>' : '');
+}
+
+function submitEditUser(staffId) {
+  clearAlert('edituser-alert');
+  const updates = {
+    name:             (document.getElementById('eu-name')      ? document.getElementById('eu-name').value.trim()      : ''),
+    email:            (document.getElementById('eu-email')     ? document.getElementById('eu-email').value.trim()     : ''),
+    phoneNumber:      (document.getElementById('eu-phone')     ? document.getElementById('eu-phone').value.trim()     : ''),
+    subjectSpecialty: (document.getElementById('eu-specialty') ? document.getElementById('eu-specialty').value.trim() : ''),
+    employmentStatus: (document.getElementById('eu-status')    ? document.getElementById('eu-status').value           : '')
+  };
+  if (!updates.name) { showAlert('edituser-alert', 'Full name is required.', 'error'); return; }
+  setButtonLoading('eu-save-btn', true);
+  google.script.run
+    .withSuccessHandler(function (result) {
+      setButtonLoading('eu-save-btn', false);
+      if (handleSessionExpired(result)) return;
+      if (!result.success) { showAlert('edituser-alert', result.error, 'error'); return; }
+      showToast('User updated.', 'success'); renderView('userList');
+    })
+    .withFailureHandler(function () { setButtonLoading('eu-save-btn', false); showAlert('edituser-alert', 'Connection error.', 'error'); })
+    .serverUpdateUser(App.token, staffId, updates);
+}
+
+function submitResetPassword(staffId) {
+  const newPw = document.getElementById('eu-new-temp-pw') ? document.getElementById('eu-new-temp-pw').value : '';
+  if (!newPw || newPw.length < 8) { showFieldError('eu-new-temp-pw', 'Password must be at least 8 characters.'); return; }
+  clearFieldError('eu-new-temp-pw');
+  setButtonLoading('eu-reset-pw-btn', true);
+  google.script.run
+    .withSuccessHandler(function (result) {
+      setButtonLoading('eu-reset-pw-btn', false);
+      if (handleSessionExpired(result)) return;
+      if (!result.success) { showAlert('edituser-alert', result.error, 'error'); return; }
+      // Navigate back to the user list so the admin sees a clear confirmation.
+      // The toast appears on top of the user list after navigation.
+      showToast('Password reset. User will be forced to change it on next login.', 'success');
+      renderView('userList');
+    })
+    .withFailureHandler(function () { setButtonLoading('eu-reset-pw-btn', false); showAlert('edituser-alert', 'Connection error.', 'error'); })
+    .serverResetPassword(App.token, staffId, newPw);
+}
+
+function submitChangeRole(staffId, newRole) {
+  if (!confirm('Change this user\'s role to "' + newRole + '"?')) return;
+  google.script.run
+    .withSuccessHandler(function (result) {
+      if (handleSessionExpired(result)) return;
+      if (!result.success) { showToast(result.error, 'error'); return; }
+      showToast(result.data.message, 'success'); renderView('userList');
+    })
+    .withFailureHandler(function () { showToast('Connection error.', 'error'); })
+    .serverChangeRole(App.token, staffId, newRole);
+}
+
+
+// ════════════════════════════════════════════════════════════════════════════
+// STAGE 3 — TEACHER & SCORE ENTRY VIEWS
+// ════════════════════════════════════════════════════════════════════════════
+
+// ─── TEACHER HOME ─────────────────────────────────────────────────────────
+// Two-section layout: FM Classes (top) and Teaching Assignments (bottom).
+// Uses cached App._myFMClasses / App._myTSAssignments if already loaded by
+// initAdminHome; otherwise fetches fresh from serverGetMyAssignments.
+
+Views.teacherHome = function (params) {
+  // Show back button only if there is navigation history — i.e. the user
+  // arrived here by tapping "My Teaching" from Admin Home.
+  // For a pure teacher who just logged in, _navHistory is empty and there
+  // is nowhere to go back to, so the button is hidden.
+  const hasHistory = App._navHistory.length > 0;
+  const html =
+    appBarHtml('My Teaching', 'Score entry & class management', hasHistory, 'back') +
+    '<div class="view-body" id="teacher-home-body">' +
+    '  <div class="loading-placeholder">Loading your assignments…</div>' +
+    '</div>';
+  return html;
+};
+
+function initTeacherHome() {
+  // Reuse cached data if already loaded (admin flow via My Teaching tile)
+  if (App._assignmentsLoaded) {
+    renderTeacherHomeSections(App._myFMClasses, App._myTSAssignments);
+    return;
+  }
+  // Pure teacher login: fetch from server
+  google.script.run
+    .withSuccessHandler(function (result) {
+      if (handleSessionExpired(result)) return;
+      if (!result.success) {
+        document.getElementById('teacher-home-body').innerHTML =
+          '<p class="error-msg">' + (result.error || 'Failed to load assignments.') + '</p>';
+        return;
+      }
+      const data           = result.data || {};
+      App._myFMClasses     = data.fmClasses     || [];
+      App._myTSAssignments = data.tsAssignments || [];
+      App._assignmentsLoaded = true;
+      renderTeacherHomeSections(App._myFMClasses, App._myTSAssignments);
+    })
+    .withFailureHandler(function () {
+      document.getElementById('teacher-home-body').innerHTML =
+        '<p class="error-msg">Connection error. Please try again.</p>';
+    })
+    .serverGetMyAssignments(App.token);
+}
+
+// Builds the two home sections from cached assignment arrays and injects into DOM.
+//
+// Card design: standalone rounded tiles with light-colored backgrounds.
+//   FM cards  → blue tint  (.home-card--fm)
+//   TS cards  → green tint (.home-card--ts)
+//
+// Both text lines (.home-card__name and .home-card__detail) are the same font
+// size (var(--text-sm)). Name is bold; detail is normal weight and muted.
+//
+// Class names for SSS classes have the department suffix stripped
+// (e.g. "SSS 2 Science" → "SSS 2") to keep labels concise.
+function renderTeacherHomeSections(fmClasses, tsAssignments) {
+
+  // ── Helper: strip department from SSS/JSS class names ──────────────────────
+  // "SSS 1 Science" → "SSS 1"   "JSS 3 Art" → "JSS 3"
+  // Departments: Science, Art, Commerce, Humanities, Business
+  function stripDept(name) {
+    return (name || '').replace(/\s+(science|art|commerce|humanities|business)\s*$/i, '').trim();
+  }
+
+  // ── Time-based greeting ────────────────────────────────────────────────────
+  // Uses the teacher's stored name and the local hour to pick a salutation.
+  // First name only (split on space) keeps it friendly and concise.
+  const hour      = new Date().getHours();
+  // Salutation and emoji change based on time of day
+  const salutation = hour < 12 ? 'Good morning ☀️'
+                   : hour < 17 ? 'Good afternoon 🌤️'
+                   :             'Good evening 🌒';
+  // Display the teacher's full name as stored in their account
+  const fullName = (App.user && App.user.name) ? App.user.name : 'Teacher';
+
+  let html = '<div class="page-content">';
+  html +=
+    '<div class="home-greeting">' +
+    '<div class="home-greeting__salutation">' + salutation + ',</div>' +
+    '<div class="home-greeting__name">' + escHtml(fullName) + '</div>' +
+    '</div>';
+
+  // ── Section 1: Form Master classes ─────────────────────────────────────────
+  if (fmClasses.length > 0) {
+    html += '<div class="home-section">';
+    html += '<div class="home-section__title">Form Master Classes</div>';
+    fmClasses.forEach(function (cls) {
+      const count = cls.studentCount || 0;
+      const countLabel = count + ' student' + (count !== 1 ? 's' : '');
+      html +=
+        '<button class="home-card home-card--fm" ' +
+        'onclick="navigateTo(\'fmClassOverview\',{classId:\'' + cls.classId +
+        '\',className:\'' + escHtml(cls.className) + '\'})">' +
+        '<span class="home-card__name">' + escHtml(cls.className) + '</span>' +
+        '<span class="home-card__detail">Form Master · ' + countLabel + '</span>' +
+        '</button>';
+    });
+    html += '</div>';
+  }
+
+  // ── Section 2: Teacher-subject assignments ──────────────────────────────────
+  if (tsAssignments.length > 0) {
+    html += '<div class="home-section">';
+    html += '<div class="home-section__title">Teaching Assignments</div>';
+    tsAssignments.forEach(function (a) {
+      // Strip the department suffix here so both the card display AND the
+      // className passed into componentSelector show the short form.
+      // e.g. "SSS 1 Science" → "SSS 1" in both places.
+      const shortClass = escHtml(stripDept(a.className));
+      html +=
+        '<button class="home-card home-card--ts" ' +
+        'onclick="navigateTo(\'componentSelector\',{classId:\'' + a.classId +
+        '\',className:\'' + shortClass +
+        '\',subjectId:\'' + a.subjectId +
+        '\',subjectName:\'' + escHtml(a.subjectName) + '\'})">' +
+        '<span class="home-card__name">' + escHtml(a.subjectName) + '</span>' +
+        '<span class="home-card__detail">' + shortClass + '</span>' +
+        '</button>';
+    });
+    html += '</div>';
+  }
+
+  // ── Empty state ─────────────────────────────────────────────────────────────
+  if (fmClasses.length === 0 && tsAssignments.length === 0) {
+    html +=
+      '<div class="empty-state mt-lg">' +
+      '<div class="empty-state__icon">📚</div>' +
+      '<h3>No Assignments This Term</h3>' +
+      '<p>You have not been assigned as a Form Master or subject teacher ' +
+      'for this term. Contact your administrator if this seems incorrect.</p>' +
+      '</div>';
+  }
+
+  html += '</div>';
+  document.getElementById('teacher-home-body').innerHTML = html;
+}
+
+// ─── FM CLASS OVERVIEW ─────────────────────────────────────────────────────
+// Shows: FM action buttons (PSQ / Remarks / Manage Class List),
+// a student list with status badges, and optionally a subject grid if the
+// FM has been granted full score access (grantedFullAccess === true).
+
+Views.fmClassOverview = function (params) {
+  const className = (params && params.className) || 'Class';
+  const html =
+    appBarHtml(className, 'Form Master Overview', true, 'back') +
+    '<div class="view-body" id="fmoverview-body">' +
+    '  <div class="loading-placeholder">Loading class overview…</div>' +
+    '</div>';
+  return html;
+};
+
+function initFmClassOverview(params) {
+  const classId   = params && params.classId;
+  const className = (params && params.className) || '';
+
+  google.script.run
+    .withSuccessHandler(function (result) {
+      if (handleSessionExpired(result)) return;
+      if (!result.success) {
+        document.getElementById('fmoverview-body').innerHTML =
+          '<p class="error-msg">' + (result.error || 'Failed to load.') + '</p>';
+        return;
+      }
+
+      const data              = result.data || {};
+      const students          = data.students          || [];
+      const subjects          = data.subjects          || [];
+      const grantedFullAccess = !!data.grantedFullAccess;
+
+      // Outer wrapper adds top spacing above the first section-card.
+      // Section-cards provide their own side + bottom margins.
+      let html = '<div style="padding-top:var(--space-md)">';
+
+      // ── Quick-Action Card ─────────────────────────────────────────────────
+      // Three full-width list-item buttons: PSQ Ratings, Remarks, Manage Class.
+      // Each shows: [icon]  [label]  [›]
+      html += '<div class="section-card">';
+      // Static header — just a label, not a collapse toggle
+      html +=
+        '<div class="section-card__header" style="cursor:default">' +
+        '<span class="section-card__title">Quick Actions</span>' +
+        '</div>';
+
+      // PSQ Ratings
+      html +=
+        '<button class="fm-action-btn" ' +
+        'onclick="navigateTo(\'psqEntry\',{classId:\'' + classId +
+        '\',className:\'' + escHtml(className) + '\'})">' +
+        '<span class="fm-action-btn__icon">📋</span>' +
+        '<span class="fm-action-btn__label">PSQ Ratings</span>' +
+        '<span class="fm-action-btn__arrow">›</span>' +
+        '</button>';
+
+      // Remarks
+      html +=
+        '<button class="fm-action-btn" ' +
+        'onclick="navigateTo(\'remarksEntry\',{classId:\'' + classId +
+        '\',className:\'' + escHtml(className) + '\'})">' +
+        '<span class="fm-action-btn__icon">📝</span>' +
+        '<span class="fm-action-btn__label">Remarks</span>' +
+        '<span class="fm-action-btn__arrow">›</span>' +
+        '</button>';
+
+      // Manage Class List
+      html +=
+        '<button class="fm-action-btn" ' +
+        'onclick="navigateTo(\'manageClassList\',{classId:\'' + classId +
+        '\',className:\'' + escHtml(className) + '\'})">' +
+        '<span class="fm-action-btn__icon">👥</span>' +
+        '<span class="fm-action-btn__label">Manage Class List</span>' +
+        '<span class="fm-action-btn__arrow">›</span>' +
+        '</button>';
+
+      html += '</div>'; // end .section-card (quick actions)
+
+      // ── Collapsible Student List ──────────────────────────────────────────
+      // Header row is tappable — clicking it calls toggleStudentList().
+      // List body defaults to hidden; the chevron rotates when expanded.
+      html += '<div class="section-card">';
+      html +=
+        '<div class="section-card__header" onclick="toggleStudentList()">' +
+        '<span class="section-card__title">Students (' + students.length + ')</span>' +
+        '<span class="collapsible-toggle" id="student-list-chevron">›</span>' +
+        '</div>';
+
+      // Body is hidden by default — user taps header to reveal
+      html += '<div id="student-list-body" style="display:none">';
+      if (students.length === 0) {
+        html += '<p class="empty-msg" style="padding:var(--space-md)">No students found.</p>';
+      } else {
+        html += '<ul class="student-list">';
+        students.forEach(function (s) {
+          // StudentService stores the name under the key "fullName"
+          // (from the "Full Name" column header → toCamelCase → fullName).
+          // We fall back to s.name so the list is never empty even if the
+          // key ever changes.
+          const name        = s.fullName || s.name || '—';
+          const statusLabel = s.termStatus || 'Active';
+          const badgeClass  =
+            statusLabel === 'Exam Exempt'    ? 'badge--exempt' :
+            statusLabel === 'Not Continuing' ? 'badge--nc'     : 'badge--active';
+
+          html +=
+            '<li class="student-list__item">' +
+            '<span class="student-list__name">' + escHtml(name) + '</span>' +
+            '<span class="badge ' + badgeClass + '">' + escHtml(statusLabel) + '</span>' +
+            '</li>';
+        });
+        html += '</ul>';
+      }
+      html += '</div>'; // end #student-list-body
+      html += '</div>'; // end .section-card (students)
+
+      // ── Subject Grid ─────────────────────────────────────────────────────
+      // Only shown when the FM has been granted full score-entry access.
+      // Tapping a subject navigates to componentSelector for that subject.
+      if (grantedFullAccess && subjects.length > 0) {
+        html += '<div class="section-card">';
+        html +=
+          '<div class="section-card__header" style="cursor:default">' +
+          '<span class="section-card__title">Enter Scores by Subject</span>' +
+          '</div>';
+        html += '<div class="subject-grid">';
+        subjects.forEach(function (sub) {
+          html +=
+            '<button class="subject-btn" ' +
+            'onclick="navigateTo(\'componentSelector\',{classId:\'' + classId +
+            '\',className:\'' + escHtml(className) +
+            '\',subjectId:\'' + sub.subjectId +
+            '\',subjectName:\'' + escHtml(sub.subjectName) + '\'})">' +
+            escHtml(sub.subjectName) +
+            '</button>';
+        });
+        html += '</div>';
+        html += '</div>'; // end .section-card (subjects)
+      }
+
+      html += '</div>'; // end outer padding wrapper
+
+      document.getElementById('fmoverview-body').innerHTML = html;
+    })
+    .withFailureHandler(function () {
+      document.getElementById('fmoverview-body').innerHTML =
+        '<p class="error-msg">Connection error. Please try again.</p>';
+    })
+    .serverGetFMClassOverview(App.token, classId);
+}
+
+/**
+ * Toggle the student list on the FM Class Overview screen.
+ *
+ * The list body (#student-list-body) is hidden by default so it doesn't
+ * dominate the screen. Tapping the section-card header calls this function.
+ *
+ * The chevron (#student-list-chevron) has the CSS class "is-open" added
+ * when the list is visible — the stylesheet rotates it 90° so it points
+ * downward when expanded and rightward when collapsed.
+ *
+ * HOW TO MODIFY: If you want the list to default to open, change
+ * the initial style="display:none" in initFmClassOverview to style="display:block"
+ * and call chevron.classList.add('is-open') after the DOM is built.
+ */
+function toggleStudentList() {
+  var body    = document.getElementById('student-list-body');
+  var chevron = document.getElementById('student-list-chevron');
+  if (!body) return;
+
+  var isCurrentlyOpen = body.style.display !== 'none';
+
+  // Flip visibility
+  body.style.display = isCurrentlyOpen ? 'none' : '';
+
+  // Rotate chevron to match new state
+  if (chevron) {
+    if (isCurrentlyOpen) {
+      chevron.classList.remove('is-open'); // collapses → points right ›
+    } else {
+      chevron.classList.add('is-open');    // expands → points down ↓
+    }
+  }
+}
+
+// ─── COMPONENT SELECTOR ────────────────────────────────────────────────────
+// Shows 6 component tiles (C/W, ASS, ATT, Test1, Test2, Exam).
+// Each tile shows entered/total count and a progress bar.
+// Locked tiles (e.g. Exam until Test1+Test2 done) are greyed and non-clickable.
+
+Views.componentSelector = function (params) {
+  const subjectName = (params && params.subjectName) || 'Subject';
+  const className   = (params && params.className)   || '';
+  const html =
+    appBarHtml(subjectName, className, true, 'back') +
+    '<div class="view-body" id="compselector-body">' +
+    '  <div class="loading-placeholder">Loading component progress…</div>' +
+    '</div>';
+  return html;
+};
+
+function initComponentSelector(params) {
+  const classId     = params && params.classId;
+  const subjectId   = params && params.subjectId;
+  const className   = (params && params.className)   || '';
+  const subjectName = (params && params.subjectName) || '';
+  google.script.run
+    .withSuccessHandler(function (result) {
+      if (handleSessionExpired(result)) return;
+      if (!result.success) {
+        document.getElementById('compselector-body').innerHTML =
+          '<p class="error-msg">' + (result.error || 'Failed to load.') + '</p>';
+        return;
+      }
+      // Server returns { statuses: [...] } — each item uses "entered" and "total"
+      const statuses = (result.data && result.data.statuses) || [];
+
+      // DISPLAY_LABEL is the global COMPONENT_DISPLAY_LABEL constant defined above Views.
+
+      // ── Component groupings ─────────────────────────────────────────────────
+      // Each group is rendered as its own section with a heading above the grid.
+      // The order of keys inside each group matches COMPONENT_ORDER on the server.
+      var GROUPS = [
+        { title: 'Class Performance',     keys: ['C/W', 'ASS', 'ATT'] },
+        { title: 'Continuous Assessment', keys: ['Test1', 'Test2']    },
+        { title: 'Overall Evaluation',    keys: ['Exam']              }
+      ];
+
+      // Build a quick lookup: component key → status object
+      var byKey = {};
+      statuses.forEach(function (s) { byKey[s.component] = s; });
+
+      // ── Build tile HTML helper ──────────────────────────────────────────────
+      function buildTile(comp) {
+        var isLocked   = !!comp.locked;
+        var isComplete = !isLocked && comp.total > 0 && comp.entered >= comp.total;
+
+        var tileClass = 'component-tile';
+        if (isLocked)   tileClass += ' component-tile--locked';
+        if (isComplete) tileClass += ' component-tile--complete';
+
+        var pct = comp.total > 0
+          ? Math.round((comp.entered / comp.total) * 100) : 0;
+
+        var clickAttr = isLocked ? '' :
+          'onclick="navigateTo(\'scoreEntry\',{classId:\'' + classId +
+          '\',className:\'' + escHtml(className) +
+          '\',subjectId:\'' + subjectId +
+          '\',subjectName:\'' + escHtml(subjectName) +
+          '\',component:\'' + comp.component + '\'})"';
+
+        var displayName = COMPONENT_DISPLAY_LABEL[comp.component] || comp.component;
+
+        return '<div class="' + tileClass + '" ' + clickAttr + '>' +
+          // Name at the top of the tile
+          '<span class="component-tile__name">' + escHtml(displayName) + '</span>' +
+          // Spacer always comes right after name — pushes content to the bottom
+          '<div class="component-tile__spacer"></div>' +
+          // Lock reason sits at the bottom on locked tiles (bar + count hidden via CSS)
+          (isLocked
+            ? '<span class="component-tile__lock-reason">🔒 ' +
+              escHtml(comp.lockReason || 'Locked') + '</span>'
+            : '') +
+          // Count and progress bar at the bottom
+          '<span class="component-tile__count">' +
+          comp.entered + ' / ' + comp.total + '</span>' +
+          '<div class="component-tile__bar">' +
+          '<div class="component-tile__bar-fill" style="width:' + pct + '%"></div>' +
+          '</div>' +
+          '</div>';
+      }
+
+      // ── Render all groups ───────────────────────────────────────────────────
+      var html = '<div style="padding-top:var(--space-md)">';
+      GROUPS.forEach(function (group) {
+        html += '<div class="component-section">';
+        html += '<div class="component-section__title">' + group.title + '</div>';
+        html += '<div class="component-grid">';
+        group.keys.forEach(function (key) {
+          if (byKey[key]) html += buildTile(byKey[key]);
+        });
+        html += '</div>'; // end .component-grid
+        html += '</div>'; // end .component-section
+      });
+      html += '</div>'; // end outer wrapper
+
+      document.getElementById('compselector-body').innerHTML = html;
+    })
+    .withFailureHandler(function () {
+      document.getElementById('compselector-body').innerHTML =
+        '<p class="error-msg">Connection error. Please try again.</p>';
+    })
+    .serverGetComponentStatuses(App.token, classId, subjectId);
+}
+
+
+// ─── SCORE ENTRY ───────────────────────────────────────────────────────────
+// Full student roster for one component. Active students get a number input;
+// excluded students (Not Continuing / Exam Exempt) are shown greyed with a
+// label instead of an input. Sticky "Save All Scores" footer at bottom.
+
+Views.scoreEntry = function (params) {
+  const component    = (params && params.component)   || '';
+  const subjectName  = (params && params.subjectName) || '';
+  const className    = (params && params.className)   || '';
+  // Show the friendly label (e.g. "Class Work") rather than the raw key ("C/W")
+  const displayLabel = COMPONENT_DISPLAY_LABEL[component] || component;
+  // Subtitle shows "ClassName · SubjectName" so teachers always know which
+  // class they are scoring — e.g. "JSS 3 · Digital Technologies"
+  const subtitle     = className ? className + ' · ' + subjectName : subjectName;
+  const html =
+    appBarHtml(displayLabel, subtitle, true, 'back') +
+    '<div class="view-body" id="score-entry-body">' +
+    '  <div class="loading-placeholder">Loading score sheet…</div>' +
+    '</div>';
+  return html;
+};
+
+function initScoreEntry(params) {
+  const classId     = params && params.classId;
+  const subjectId   = params && params.subjectId;
+  const component   = params && params.component;
+  const subjectName = (params && params.subjectName) || '';
+  const className   = (params && params.className)   || '';
+
+  // Store params so saveAllScores can read them
+  App._scoreData  = null;
+  App.viewParams  = params;
+
+  google.script.run
+    .withSuccessHandler(function (result) {
+      if (handleSessionExpired(result)) return;
+      if (!result.success) {
+        document.getElementById('score-entry-body').innerHTML =
+          '<p class="error-msg">' + (result.error || 'Failed to load.') + '</p>';
+        return;
+      }
+      const data     = result.data || {};
+      // Server returns { roster: [...], max: N } — not "students" / "maxScore"
+      const students = data.roster   || [];
+      const maxScore = (data.max  != null) ? data.max  : '';
+
+      // Cache for saveAllScores — include maxScore so the save function can
+      // validate against the limit without re-reading the DOM.
+      App._scoreData = {
+        classId:   classId,
+        subjectId: subjectId,
+        component: component,
+        maxScore:  maxScore !== '' ? Number(maxScore) : null
+      };
+
+      let html = '';
+
+      // Sticky banner — stays visible below the app bar while teacher scrolls.
+      // Shows the max allowed score so they know the range at all times.
+      if (maxScore !== '') {
+        html +=
+          '<div class="score-max-banner">' +
+          'Maximum score: <strong>' + maxScore + '</strong>' +
+          '</div>';
+      }
+
+      html += '<ul class="score-list" id="score-list">';
+      students.forEach(function (s) {
+        // Students marked Not Continuing or Exam Exempt get a greyed read-only row
+        const isExcluded =
+          s.termStatus === 'Not Continuing' ||
+          s.termStatus === 'Exam Exempt';
+        const rowClass   = isExcluded ? 'score-row score-row--excluded' : 'score-row';
+        const currentVal = (s.score != null && s.score !== '') ? s.score : '';
+
+        html +=
+          '<li class="' + rowClass + '" data-student-id="' + s.studentId + '">' +
+          '<span class="score-row__name">' + escHtml(s.name) + '</span>';
+
+        if (isExcluded) {
+          html +=
+            '<span class="score-row__excluded-label">' +
+            escHtml(s.termStatus || 'Excluded') + '</span>';
+        } else {
+          // data-max lets the inline oninput handler know the allowed maximum.
+          // oninput="validateScoreInput(this)" turns the input red immediately
+          // when the entered value exceeds the limit.
+          html +=
+            '<input class="score-input" type="number" min="0" ' +
+            (maxScore !== '' ? 'max="' + maxScore + '" data-max="' + maxScore + '" ' : '') +
+            'oninput="validateScoreInput(this)" ' +
+            'placeholder="–" value="' + currentVal + '">';
+        }
+
+        html += '</li>';
+      });
+      html += '</ul>';
+
+      // Sticky save footer
+      html +=
+        '<div class="sticky-footer">' +
+        '<button class="btn btn--primary btn--full" id="save-scores-btn" ' +
+        'onclick="saveAllScores()">Save All Scores</button>' +
+        '</div>';
+
+      document.getElementById('score-entry-body').innerHTML = html;
+    })
+    .withFailureHandler(function () {
+      document.getElementById('score-entry-body').innerHTML =
+        '<p class="error-msg">Connection error. Please try again.</p>';
+    })
+    .serverGetScoresForComponent(App.token, classId, subjectId, component);
+}
+
+// Reads all score inputs, validates them, and sends to serverSaveScores.
+// After a successful save navigates back to the component selector so the
+// user can see the updated progress tiles.
+function saveAllScores() {
+  if (!App._scoreData) return;
+  const classId   = App._scoreData.classId;
+  const subjectId = App._scoreData.subjectId;
+  const component = App._scoreData.component;
+
+  // Read the allowed maximum from the cached score data (set during load).
+  // null means no maximum defined (shouldn't happen in practice).
+  const maxAllowed = (App._scoreData && App._scoreData.maxScore != null)
+    ? App._scoreData.maxScore
+    : Infinity;
+
+  const rows    = document.querySelectorAll('#score-list .score-row');
+  const payload = [];
+  let hasError  = false;
+
+  rows.forEach(function (row) {
+    const studentId = row.getAttribute('data-student-id');
+    const input     = row.querySelector('.score-input');
+    if (!input) return; // excluded row — skip
+
+    const val = input.value.trim();
+    if (val === '') {
+      // Empty = no score entered yet; send null to clear
+      input.classList.remove('score-input--error');
+      payload.push({ studentId: studentId, score: null });
+    } else {
+      const num = parseFloat(val);
+      // Invalid if not a number, negative, or above the allowed maximum
+      if (isNaN(num) || num < 0 || num > maxAllowed) {
+        input.classList.add('score-input--error');
+        hasError = true;
+      } else {
+        input.classList.remove('score-input--error');
+        payload.push({ studentId: studentId, score: num });
+      }
+    }
+  });
+
+  if (hasError) {
+    // Friendly message — doesn't expose student IDs; red inputs already
+    // pinpoint the exact rows that need fixing.
+    showToast(
+      'One or more scores exceed the maximum of ' + maxAllowed +
+      '. Please correct the highlighted fields.',
+      'error'
+    );
+    return;
+  }
+
+  setButtonLoading('save-scores-btn', true);
+  google.script.run
+    .withSuccessHandler(function (result) {
+      setButtonLoading('save-scores-btn', false);
+      if (handleSessionExpired(result)) return;
+      if (!result.success) { showToast(result.error || 'Save failed.', 'error'); return; }
+      showToast('Scores saved successfully.', 'success');
+      // Go back to component selector so progress tiles refresh
+      navigateBack();
+    })
+    .withFailureHandler(function () {
+      setButtonLoading('save-scores-btn', false);
+      showToast('Connection error. Scores not saved.', 'error');
+    })
+    .serverSaveScores(App.token, classId, subjectId, component, payload);
+}
+
+/**
+ * Real-time score input validator — called via oninput on each score field.
+ *
+ * Reads the allowed maximum from the input's data-max attribute and
+ * immediately adds/removes the score-input--error class so the teacher
+ * sees red highlighting as soon as they type an out-of-range value.
+ *
+ * HOW IT WORKS:
+ *   <input data-max="6" oninput="validateScoreInput(this)" ...>
+ *   → If value > 6, adds "score-input--error" (red border + tint)
+ *   → If value ≤ 6 (or empty), removes that class
+ */
+function validateScoreInput(input) {
+  var max = parseFloat(input.getAttribute('data-max'));
+  var val = parseFloat(input.value);
+  // Only flag as error when the field has a value AND it's above the limit
+  if (!isNaN(val) && !isNaN(max) && val > max) {
+    input.classList.add('score-input--error');
+  } else {
+    input.classList.remove('score-input--error');
+  }
+}
+
+// ─── PSQ ENTRY ─────────────────────────────────────────────────────────────
+// One student at a time. Each trait has 5 rating buttons (1–5).
+// Clicking a selected button deselects it (rating = 0 / not rated).
+// Save & Next persists via serverSavePSQ then advances to the next student.
+// Prev goes back in-memory only (ratings already saved are reloaded from cache).
+
+Views.psqEntry = function (params) {
+  const className = (params && params.className) || 'Class';
+  const html =
+    appBarHtml('PSQ Ratings', className, true, 'back') +
+    '<div class="view-body" id="psq-entry-body">' +
+    '  <div class="loading-placeholder">Loading PSQ data…</div>' +
+    '</div>';
+  return html;
+};
+
+function initPsqEntry(params) {
+  const classId = params && params.classId;
+  App._psqData         = null;
+  App._currentPsqIndex = 0;
+  App.viewParams       = params;
+
+  google.script.run
+    .withSuccessHandler(function (result) {
+      if (handleSessionExpired(result)) return;
+      if (!result.success) {
+        document.getElementById('psq-entry-body').innerHTML =
+          '<p class="error-msg">' + (result.error || 'Failed to load.') + '</p>';
+        return;
+      }
+      App._psqData           = result.data || {};
+      App._psqData.students  = App._psqData.students  || [];
+      App._psqData.traitKeys = App._psqData.traitKeys || [];
+
+      if (App._psqData.students.length === 0) {
+        document.getElementById('psq-entry-body').innerHTML =
+          '<p class="empty-msg">No students found for PSQ entry.</p>';
+        return;
+      }
+      renderPsqStudent();
+    })
+    .withFailureHandler(function () {
+      document.getElementById('psq-entry-body').innerHTML =
+        '<p class="error-msg">Connection error. Please try again.</p>';
+    })
+    .serverGetClassPSQ(App.token, classId);
+}
+
+// Renders the card for App._currentPsqIndex student into #psq-entry-body.
+function renderPsqStudent() {
+  const data    = App._psqData;
+  const idx     = App._currentPsqIndex;
+  const total   = data.students.length;
+  const student = data.students[idx];
+  const traits  = data.traitKeys; // [{ key: 'attendance', label: 'Attendance' }, …]
+
+  let html = '';
+  // ── Tappable sticky progress header ────────────────────────────────────────
+  // Tapping this bar opens the student jump list drawer (openPsqJumpList).
+  // The chevron (▾) signals it is interactive.
+  html +=
+    '<div class="psq-progress" onclick="openPsqJumpList()" role="button" ' +
+    'aria-label="Open student list">' +
+    '<span class="psq-progress__text">Student ' + (idx + 1) + ' of ' + total +
+    ': <strong>' + escHtml(student.name) + '</strong></span>' +
+    '<span class="psq-progress__chevron">▾</span>' +
+    '</div>';
+
+  // Trait rating card
+  html += '<div class="psq-student-card">';
+  traits.forEach(function (trait) {
+    const savedRating = (student.ratings && student.ratings[trait.key]) || 0;
+    html += '<div class="psq-trait-row">';
+    html +=
+      '<span class="psq-trait-row__label">' + escHtml(trait.label) + '</span>';
+    html += '<div class="psq-rating" data-trait="' + trait.key + '">';
+    // Render 5 rating buttons
+    for (var r = 1; r <= 5; r++) {
+      const sel = (savedRating === r) ? ' psq-rating__btn--selected' : '';
+      html +=
+        '<button class="psq-rating__btn' + sel + '" ' +
+        'onclick="selectPsqRating(this,' + r + ',\'' + trait.key + '\')">' +
+        r + '</button>';
+    }
+    html += '</div>'; // .psq-rating
+    html += '</div>'; // .psq-trait-row
+  });
+  html += '</div>'; // .psq-student-card
+
+  // Navigation footer: Prev (if not first) + Save & Next / Save & Finish
+  html += '<div class="psq-navigator">';
+  if (idx > 0) {
+    html += '<button class="btn btn--outline" onclick="psqGoToPrev()">← Previous</button>';
+  } else {
+    html += '<span></span>'; // spacer keeps the flex layout balanced
+  }
+  const isLast = (idx === total - 1);
+  html +=
+    '<button class="btn btn--primary" id="psq-save-btn" ' +
+    'onclick="savePsqAndAdvance(' + isLast + ')">' +
+    (isLast ? 'Save & Finish' : 'Save & Next →') +
+    '</button>';
+  html += '</div>'; // .psq-navigator
+
+  document.getElementById('psq-entry-body').innerHTML = html;
+}
+
+// Toggles a rating button. Clicking the already-selected button deselects it.
+function selectPsqRating(btn, rating, traitKey) {
+  const ratingDiv  = btn.parentElement;
+  const allBtns    = ratingDiv.querySelectorAll('.psq-rating__btn');
+  const wasSelected = btn.classList.contains('psq-rating__btn--selected');
+  allBtns.forEach(function (b) { b.classList.remove('psq-rating__btn--selected'); });
+  if (!wasSelected) {
+    btn.classList.add('psq-rating__btn--selected');
+  }
+}
+
+// Collects DOM ratings, updates local cache, then calls serverSavePSQ.
+// On success: advances to next student or navigates back if last.
+function savePsqAndAdvance(isLast) {
+  const data    = App._psqData;
+  const idx     = App._currentPsqIndex;
+  const student = data.students[idx];
+  const classId = App.viewParams && App.viewParams.classId;
+
+  // Collect current ratings from DOM
+  const ratings    = {};
+  const traitDivs  = document.querySelectorAll('.psq-rating');
+  traitDivs.forEach(function (div) {
+    const traitKey = div.getAttribute('data-trait');
+    const selBtn   = div.querySelector('.psq-rating__btn--selected');
+    // 0 means "not rated"; server should treat 0 as clear/skip
+    ratings[traitKey] = selBtn ? parseInt(selBtn.textContent, 10) : 0;
+  });
+
+  // Update local cache so Prev can restore the state
+  student.ratings = ratings;
+
+  setButtonLoading('psq-save-btn', true);
+  google.script.run
+    .withSuccessHandler(function (result) {
+      setButtonLoading('psq-save-btn', false);
+      if (handleSessionExpired(result)) return;
+      if (!result.success) { showToast(result.error || 'Save failed.', 'error'); return; }
+      if (isLast) {
+        showToast('PSQ ratings saved for all students.', 'success');
+        navigateBack();
+      } else {
+        App._currentPsqIndex++;
+        renderPsqStudent();
+      }
+    })
+    .withFailureHandler(function () {
+      setButtonLoading('psq-save-btn', false);
+      showToast('Connection error. Ratings not saved.', 'error');
+    })
+    .serverSavePSQ(App.token, classId, student.studentId, ratings);
+}
+
+// Goes back to the previous student without saving (ratings already saved).
+function psqGoToPrev() {
+  if (App._currentPsqIndex > 0) {
+    App._currentPsqIndex--;
+    renderPsqStudent();
+  }
+}
+
+// ─── PSQ JUMP LIST DRAWER ──────────────────────────────────────────────────
+//
+// Three functions work together:
+//   openPsqJumpList()     — builds and appends the slide-up bottom sheet
+//   closePsqJumpList()    — removes the sheet from the DOM
+//   jumpToPsqStudent(idx) — closes the sheet and jumps to the chosen student
+//
+// The sheet lists every student with:
+//   • a numbered circle (highlighted blue for the current student)
+//   • a green ✓ badge if ALL traits for that student have been rated
+// ────────────────────────────────────────────────────────────────────────────
+
+function openPsqJumpList() {
+  const data = App._psqData;
+  if (!data || !data.students) return;
+
+  const totalTraits = (data.traitKeys || []).length;
+
+  // Build one button row per student
+  let listHtml = '';
+  data.students.forEach(function (s, i) {
+    const isActive = (i === App._currentPsqIndex);
+
+    // Count how many traits have a saved rating > 0 for this student
+    const ratedCount = (data.traitKeys || []).filter(function (t) {
+      return s.ratings && s.ratings[t.key] > 0;
+    }).length;
+    const isFullyRated = (totalTraits > 0 && ratedCount === totalTraits);
+
+    listHtml +=
+      '<button class="psq-jump-item' + (isActive ? ' psq-jump-item--active' : '') + '" ' +
+      'onclick="jumpToPsqStudent(' + i + ')">' +
+      '<span class="psq-jump-item__num">' + (i + 1) + '</span>' +
+      '<span class="psq-jump-item__name">' + escHtml(s.name || s.fullName || '—') + '</span>' +
+      (isFullyRated ? '<span class="psq-jump-item__done">✓ Done</span>' : '') +
+      '</button>';
+  });
+
+  // Assemble overlay + sheet
+  const modal = document.createElement('div');
+  modal.id = 'psq-jump-modal';
+  modal.innerHTML =
+    // Semi-transparent backdrop — tapping it closes the sheet
+    '<div class="psq-jump-overlay" onclick="closePsqJumpList()"></div>' +
+    '<div class="psq-jump-sheet">' +
+      '<div class="psq-jump-sheet__header">' +
+        '<span class="psq-jump-sheet__title">Select Student</span>' +
+        '<button class="psq-jump-sheet__close" onclick="closePsqJumpList()">✕</button>' +
+      '</div>' +
+      '<div class="psq-jump-sheet__list" id="psq-jump-list">' +
+        listHtml +
+      '</div>' +
+    '</div>';
+
+  document.body.appendChild(modal);
+
+  // Scroll the currently active student into the middle of the visible list
+  setTimeout(function () {
+    const activeItem = document.querySelector('.psq-jump-item--active');
+    if (activeItem) activeItem.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  }, 60);
+}
+
+function closePsqJumpList() {
+  const modal = document.getElementById('psq-jump-modal');
+  if (modal) modal.parentNode.removeChild(modal);
+}
+
+function jumpToPsqStudent(idx) {
+  // Close the drawer first, then re-render with the chosen student
+  closePsqJumpList();
+  App._currentPsqIndex = idx;
+  renderPsqStudent();
+}
+
+// ─── REMARKS ENTRY ─────────────────────────────────────────────────────────
+// Shows all students at once with a textarea each.
+// Sticky "Save All Remarks" button at the bottom saves the full class in one call.
+
+Views.remarksEntry = function (params) {
+  const className = (params && params.className) || 'Class';
+  const html =
+    appBarHtml('Remarks', className, true, 'back') +
+    '<div class="view-body" id="remarks-entry-body">' +
+    '  <div class="loading-placeholder">Loading remarks…</div>' +
+    '</div>';
+  return html;
+};
+
+function initRemarksEntry(params) {
+  const classId = params && params.classId;
+  App._remarksData = null;
+  App.viewParams   = params;
+
+  google.script.run
+    .withSuccessHandler(function (result) {
+      if (handleSessionExpired(result)) return;
+      if (!result.success) {
+        document.getElementById('remarks-entry-body').innerHTML =
+          '<p class="error-msg">' + (result.error || 'Failed to load.') + '</p>';
+        return;
+      }
+      const data     = result.data || {};
+      const students = data.students || [];
+      App._remarksData = { classId: classId, students: students };
+
+      let html = '';
+      if (students.length === 0) {
+        html = '<p class="empty-msg">No students found for this class.</p>';
+      } else {
+        html += '<ul class="remark-list" id="remark-list">';
+        students.forEach(function (s) {
+          // Pre-fill textarea with existing remark (HTML-escaped)
+          html +=
+            '<li class="remark-row" data-student-id="' + s.studentId + '">' +
+            '<span class="remark-row__name">' + escHtml(s.name) + '</span>' +
+            '<textarea class="remark-input" rows="2" placeholder="Enter remark…">' +
+            escHtml(s.remark || '') +
+            '</textarea>' +
+            '</li>';
+        });
+        html += '</ul>';
+        html +=
+          '<div class="sticky-footer">' +
+          '<button class="btn btn--primary btn--full" id="save-remarks-btn" ' +
+          'onclick="saveAllRemarks()">Save All Remarks</button>' +
+          '</div>';
+      }
+      document.getElementById('remarks-entry-body').innerHTML = html;
+    })
+    .withFailureHandler(function () {
+      document.getElementById('remarks-entry-body').innerHTML =
+        '<p class="error-msg">Connection error. Please try again.</p>';
+    })
+    .serverGetClassRemarks(App.token, classId);
+}
+
+// Collects all textarea values and saves them in a single batch call.
+function saveAllRemarks() {
+  const classId = App._remarksData && App._remarksData.classId;
+  const rows    = document.querySelectorAll('#remark-list .remark-row');
+  const payload = [];
+  rows.forEach(function (row) {
+    const studentId = row.getAttribute('data-student-id');
+    const textarea  = row.querySelector('.remark-input');
+    payload.push({ studentId: studentId, remark: textarea ? textarea.value : '' });
+  });
+
+  setButtonLoading('save-remarks-btn', true);
+  google.script.run
+    .withSuccessHandler(function (result) {
+      setButtonLoading('save-remarks-btn', false);
+      if (handleSessionExpired(result)) return;
+      if (!result.success) { showToast(result.error || 'Save failed.', 'error'); return; }
+      showToast('Remarks saved successfully.', 'success');
+    })
+    .withFailureHandler(function () {
+      setButtonLoading('save-remarks-btn', false);
+      showToast('Connection error. Remarks not saved.', 'error');
+    })
+    .serverSaveRemarks(App.token, classId, payload);
+}
+
+// ─── MANAGE CLASS LIST ─────────────────────────────────────────────────────
+// Shows every student with three status chips (Active / Exam Exempt / Not Continuing).
+// The current status chip is highlighted and disabled; clicking another chip
+// calls serverSetStudentStatus immediately and then re-renders the page.
+
+Views.manageClassList = function (params) {
+  const className = (params && params.className) || 'Class';
+  const html =
+    appBarHtml('Manage Class List', className, true, 'back') +
+    '<div class="view-body" id="class-list-body">' +
+    '  <div class="loading-placeholder">Loading student list…</div>' +
+    '</div>';
+  return html;
+};
+
+function initManageClassList(params) {
+  const classId  = params && params.classId;
+  App.viewParams = params; // cache for updateStudentStatus to re-call this
+
+  google.script.run
+    .withSuccessHandler(function (result) {
+      if (handleSessionExpired(result)) return;
+      if (!result.success) {
+        document.getElementById('class-list-body').innerHTML =
+          '<p class="error-msg">' + (result.error || 'Failed to load.') + '</p>';
+        return;
+      }
+      const data     = result.data || {};
+      const students = data.students || [];
+
+      let html = '<div style="padding-top:var(--space-md)">';
+
+      if (students.length === 0) {
+        html += '<p class="empty-msg">No students found.</p>';
+      } else {
+        // ── Instruction banner ───────────────────────────────────────────────
+        // Explains the tap-to-change interaction before the list starts.
+        html +=
+          '<div class="manage-hint">' +
+          '<span class="manage-hint__icon">ℹ</span>' +
+          '<span class="manage-hint__text">Tap a status chip below to update a ' +
+          'student\'s term status immediately.</span>' +
+          '</div>';
+
+        // ── Student list in a section-card ───────────────────────────────────
+        html += '<div class="section-card">';
+        html +=
+          '<div class="section-card__header">' +
+          '<span class="section-card__title">STUDENTS — ' + students.length + '</span>' +
+          '</div>';
+
+        html += '<ul class="status-list" id="status-list">';
+        students.forEach(function (s) {
+          const current = s.termStatus || 'Active';
+          // Use fullName (toCamelCase of "Full Name" column) with fallback
+          const displayName = s.fullName || s.name || '—';
+          html +=
+            '<li class="status-list__item" data-student-id="' + s.studentId + '">' +
+            // Student name sits above the chips on its own line
+            '<span class="status-list__name">' + escHtml(displayName) + '</span>' +
+            // Three chips: Active / Exam Exempt / Not Continuing
+            '<div class="status-chips">' +
+            renderStatusChip(classId, s.studentId, 'Active',         current) +
+            renderStatusChip(classId, s.studentId, 'Exam Exempt',    current) +
+            renderStatusChip(classId, s.studentId, 'Not Continuing', current) +
+            '</div>' +
+            '</li>';
+        });
+        html += '</ul>';  // .status-list
+        html += '</div>'; // .section-card
+      }
+
+      html += '</div>'; // padding-top wrapper
+      document.getElementById('class-list-body').innerHTML = html;
+    })
+    .withFailureHandler(function () {
+      document.getElementById('class-list-body').innerHTML =
+        '<p class="error-msg">Connection error. Please try again.</p>';
+    })
+    .serverGetClassStudentStatus(App.token, classId);
+}
+
+// Builds a single status chip button.
+// Selected chip is highlighted + disabled; unselected chip fires updateStudentStatus.
+function renderStatusChip(classId, studentId, status, currentStatus) {
+  const isSelected = (status === currentStatus);
+  let chipClass = 'status-chip';
+  if (isSelected) {
+    if (status === 'Active')          chipClass += ' status-chip--active-sel';
+    else if (status === 'Exam Exempt') chipClass += ' status-chip--exempt-sel';
+    else                               chipClass += ' status-chip--nc-sel';
+  }
+  const clickHandler = isSelected
+    ? '' // already selected — clicking does nothing
+    : 'onclick="updateStudentStatus(\'' + classId +
+      '\',\'' + studentId +
+      '\',\'' + status + '\')"';
+  return (
+    '<button class="' + chipClass + '" ' + clickHandler +
+    (isSelected ? ' disabled' : '') + '>' +
+    escHtml(status) +
+    '</button>'
+  );
+}
+
+// Calls serverSetStudentStatus immediately; on success refreshes the whole list.
+function updateStudentStatus(classId, studentId, newStatus) {
+  google.script.run
+    .withSuccessHandler(function (result) {
+      if (handleSessionExpired(result)) return;
+      if (!result.success) { showToast(result.error || 'Update failed.', 'error'); return; }
+      showToast('Status updated to "' + newStatus + '".', 'success');
+      // Refresh the page so the chips reflect the new state
+      initManageClassList(App.viewParams);
+    })
+    .withFailureHandler(function () {
+      showToast('Connection error. Status not updated.', 'error');
+    })
+    .serverSetStudentStatus(App.token, classId, studentId, newStatus);
+}
+
+</script>
+
+

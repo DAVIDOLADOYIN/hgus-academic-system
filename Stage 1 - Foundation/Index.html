@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+  <meta name="theme-color" content="#1565c0">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <title>HGUS Academic System</title>
+
+  <?!= include('StyleBase') ?>
+</head>
+<body>
+
+  <!-- SPA root — all views are rendered here by AppScript.html -->
+  <div id="app">
+    <!-- Initial loading state shown before JS takes over -->
+    <div class="loading-overlay" id="initial-loader" style="display:flex;">
+      <div class="spinner spinner--blue" style="width:40px;height:40px;border-width:4px;"></div>
+      <p>Loading HGUS Academic System…</p>
+    </div>
+  </div>
+
+  <!-- Toast notification container -->
+  <div class="toast-container" id="toast-container"></div>
+
+  <?!= include('AppScript') ?>
+
+</body>
+</html>

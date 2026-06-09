@@ -1,0 +1,823 @@
+<!--
+  ══════════════════════════════════════════════════════════════════════════════
+  HGUS Academic Result Management System — Stage 6 AppScript Additions
+  ══════════════════════════════════════════════════════════════════════════════
+
+  HOW TO USE THIS FILE
+  ─────────────────────
+  These are the Stage 6 ADDITIONS ONLY.
+  They do not replace Stage 5 — they extend it.
+
+  MERGE STEP (do this once when deploying Stage 6):
+  ─────────────────────────────────────────────────
+  1. Open your GAS project → AppScript.html
+  2. Scroll to the very end of the file.
+  3. You will see:    ... gradeClass function... </script>
+  4. Copy EVERYTHING inside <script> tags below (lines marked START → END).
+  5. In AppScript.html, place your cursor JUST BEFORE the closing </script> tag.
+  6. Paste the copied code there.
+  7. Save.
+
+  The result should look like:
+      ... (all existing Stage 5 code) ...
+      ... gradeClass() function ...
+
+      // ═══════ STAGE 6 ADDITIONS ═══════
+      ... new Stage 6 code pasted here ...
+  </script>
+
+  ══════════════════════════════════════════════════════════════════════════════
+-->
+
+<script>
+// ═══════════════════════════════════════════════════════════════════════════════
+// STAGE 6 ADDITIONS — paste everything between these markers into AppScript.html
+//                     just before the closing </script> tag
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ─── EXTEND ADMIN HOME: Add Admin Dashboard tile ──────────────────────────────
+//
+// We wrap the Stage 5 Views.adminHome to inject a new "Admin Dashboard" tile
+// without touching the Stage 5 code. The tile opens the school-wide results
+// overview screen added in Stage 6.
+
+(function () {
+  var _origAdminHome = Views.adminHome;
+
+  Views.adminHome = function () {
+    var origHtml = _origAdminHome();
+
+    // Build the new tile HTML
+    var dashTile =
+      '<button class="nav-tile" onclick="renderView(\'resultsOverview\')">' +
+        '<span class="nav-tile__icon">📈</span>' +
+        '<span class="nav-tile__label">Admin Dashboard</span>' +
+        '<span class="nav-tile__sub">School-wide completion &amp; exports</span>' +
+      '</button>';
+
+    // Insert before the LAST </div> in the rendered HTML.
+    // That closing div belongs to .nav-tiles — so we slot the tile just inside it.
+    var lastDiv = origHtml.lastIndexOf('</div>');
+    if (lastDiv !== -1) {
+      return origHtml.substring(0, lastDiv) + dashTile + origHtml.substring(lastDiv);
+    }
+    return origHtml + dashTile;
+  };
+})();
+
+// ─── EXTEND renderView: Add resultsOverview route ─────────────────────────────
+//
+// renderView() has a local `renderers` object we can't modify after the fact.
+// We replace the function entirely here, delegating back to the original for
+// all pre-existing views and handling `resultsOverview` ourselves.
+
+(function () {
+  var _origRenderView = renderView;  // capture Stage 5 reference
+
+  renderView = function (view, params) {
+
+    // ── Stage 6: handle the new resultsOverview view ─────────────────────────
+    if (view === 'resultsOverview') {
+      App.currentView     = view;
+      App.viewParams      = params || {};
+      App.profileMenuOpen = false;
+      document.getElementById('app').innerHTML = Views.resultsOverview(App.viewParams);
+      initView(view, App.viewParams);
+      resetInactivityTimer();
+      return;
+    }
+
+    // ── All other views: delegate to Stage 5 ────────────────────────────────
+    _origRenderView(view, params);
+  };
+})();
+
+// ─── EXTEND initView: Add Stage 6 inits and injections ────────────────────────
+//
+// We wrap initView to:
+//   1. Run the Stage 5 init as normal.
+//   2. After the broadsheet views finish loading, inject export bars.
+//   3. After the assignments view loads, check if carry-forward is needed.
+//   4. Handle our new resultsOverview view.
+
+(function () {
+  var _origInitView = initView;  // capture Stage 5 reference
+
+  initView = function (view, params) {
+
+    // ── Run Stage 5 init first (loads data, fills loading placeholders) ──────
+    _origInitView(view, params);
+
+    // ── Strip leading arrow characters from any "Download" buttons ───────────
+    // Stage 5 may prefix download buttons with ⬇ or similar Unicode arrows.
+    // This runs after each view change to clean them up without modifying Stage 5.
+    // Only targets buttons whose text STARTS with a non-letter character AND
+    // contains "Download" — so other icon-prefixed buttons are unaffected.
+    setTimeout(function () {
+      var allBtns = document.querySelectorAll('button');
+      for (var bi = 0; bi < allBtns.length; bi++) {
+        var btn = allBtns[bi];
+        var t = (btn.textContent || '').trim();
+        // Match: starts with non-word char(s) followed by "Download" anywhere
+        if (/^[^\w]+.*[Dd]ownload/.test(t)) {
+          btn.textContent = t.replace(/^[^\w]+\s*/, '');
+        }
+      }
+    }, 150);
+
+
+    // ── Stage 6: inject export bars and carry-forward card ───────────────────
+
+    if (view === 'broadsheetView') {
+      // Wait until the broadsheet data is rendered, then inject export buttons.
+      initBroadsheetExportBar(params);
+    }
+
+    if (view === 'broadsheetSubjectDetail') {
+      initScoreSheetExportBar(params);
+    }
+
+    if (view === 'assignments') {
+      // After the assignments view has loaded, check carry-forward availability.
+      initCarryForwardSection();
+    }
+
+    if (view === 'resultsOverview') {
+      // Stage 5's initView doesn't know this view — our wrapper handles it here.
+      initResultsOverview(params);
+    }
+  };
+})();
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// RESULTS OVERVIEW VIEW
+// Admin-only school-wide dashboard: all class groups, completion state,
+// and export buttons (PDF + Excel per group).
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ─── RENDERER ─────────────────────────────────────────────────────────────────
+
+Views.resultsOverview = function () {
+  return (
+    appBarHtml('Admin Dashboard', 'School-wide completion & exports', true, 'adminHome') +
+    '<div class="view-body" id="overview-body">' +
+      '<div class="loading-placeholder">Loading overview…</div>' +
+    '</div>'
+  );
+};
+
+// ─── INIT ─────────────────────────────────────────────────────────────────────
+
+function initResultsOverview() {
+  google.script.run
+    .withSuccessHandler(function (result) {
+      if (handleSessionExpired(result)) return;
+      var body = document.getElementById('overview-body');
+      if (!body) return;
+
+      if (!result || !result.success) {
+        body.innerHTML =
+          '<div class="page-content"><div class="alert alert--error">' +
+          escHtml((result && result.error) || 'Could not load overview.') +
+          '</div></div>';
+        return;
+      }
+      renderResultsOverview(result.data);
+    })
+    .withFailureHandler(function (err) {
+      var body = document.getElementById('overview-body');
+      if (body) {
+        body.innerHTML =
+          '<div class="page-content"><div class="alert alert--error">Connection error: ' +
+          escHtml((err && err.message) || 'Please try again.') + '</div></div>';
+      }
+    })
+    .serverGetResultsOverview(App.token);
+}
+
+// ─── RENDER HELPER ────────────────────────────────────────────────────────────
+
+/**
+ * Build and inject the overview content into #overview-body.
+ *
+ * Layout per class-group card:
+ *   - Group name as section title (e.g. "JSS 1")
+ *   - Padded body containing:
+ *       • Three progress bars: Scores, PSQ, Remarks — each shows % complete
+ *       • A small count line below the bars (e.g. "75 / 259 scores entered")
+ *       • Status badges: Broadsheet locked/unlocked, Results locked/unlocked
+ *       • Export row: PDF + Excel buttons (disabled when broadsheet is locked)
+ *
+ * FIX NOTES (patch applied after initial deployment):
+ *   - Progress pct now shows "xx%" (fixed width 34px) instead of "x/total"
+ *     which was truncating for large classes (e.g. "0/3888" didn't fit)
+ *   - Added padding wrapper inside each section-card so bars & badges don't
+ *     sit flush against the card edges
+ *   - Removed arrow characters (⬇) from all button labels for a cleaner UI
+ *   - Status badges now render correctly using .status-badge CSS class
+ *
+ * @param {{ session, term, groups: [] }} data
+ */
+function renderResultsOverview(data) {
+  var body = document.getElementById('overview-body');
+  if (!body) return;
+
+  var session = data.session || '—';
+  var term    = data.term    || '—';
+  var groups  = data.groups  || [];
+
+  if (groups.length === 0) {
+    body.innerHTML =
+      '<div class="page-content"><div class="empty-state mt-lg">' +
+        '<div class="empty-state__icon">🏫</div>' +
+        '<h3>No Classes Found</h3>' +
+        '<p>Sync classes from Session Settings first.</p>' +
+      '</div></div>';
+    return;
+  }
+
+  // ── Header: Current Period ────────────────────────────────────────────────
+  var html =
+    '<div class="page-content">' +
+    '<div class="section-card">' +
+      '<div class="section-title">CURRENT PERIOD</div>' +
+      '<div class="info-card__row"><span>Session</span><strong>' + escHtml(session) + '</strong></div>' +
+      '<div class="info-card__row"><span>Term</span><strong>'    + escHtml(term)    + '</strong></div>' +
+    '</div>';
+
+  // ── One card per class group ───────────────────────────────────────────────
+  groups.forEach(function (g) {
+    var gk  = g.groupKey || '—';
+    var d   = g.detail   || {};
+
+    // ── Calculate percentage values for the three progress bars ─────────────
+    // We show PERCENTAGE (e.g. "73%") in the narrow pct label because raw
+    // counts like "75/259" are too long for the 34px fixed-width label.
+    // The actual count (e.g. "75 / 259 entries") is shown as a secondary
+    // line below all three bars so admins can still see exact numbers.
+
+    var scoresTotal   = (d.scores   && d.scores.required)          || 0;
+    var scoresEntered = (d.scores   && d.scores.entered)           || 0;
+    var scorePct      = scoresTotal > 0 ? Math.round(scoresEntered / scoresTotal * 100) : 0;
+
+    var psqRequired   = (d.psq      && d.psq.studentsRequired)     || 0;
+    var psqComplete   = (d.psq      && d.psq.studentsComplete)     || 0;
+    var psqPct        = psqRequired > 0 ? Math.round(psqComplete / psqRequired * 100) : 0;
+
+    var remRequired   = (d.remarks  && d.remarks.studentsRequired) || 0;
+    var remComplete   = (d.remarks  && d.remarks.studentsComplete) || 0;
+    var remPct        = remRequired > 0 ? Math.round(remComplete / remRequired * 100) : 0;
+
+    // ── Status badges ────────────────────────────────────────────────────────
+    var bsBadge = g.broadsheetUnlocked
+      ? '<span class="status-badge status-badge--success">Broadsheet ✓</span>'
+      : '<span class="status-badge status-badge--warn">Broadsheet 🔒</span>';
+    var resBadge = g.resultsUnlocked
+      ? '<span class="status-badge status-badge--success">Results ✓</span>'
+      : '<span class="status-badge status-badge--warn">Results 🔒</span>';
+
+    // ── Export button disabled state ─────────────────────────────────────────
+    // Buttons are only enabled when the broadsheet lock has been lifted.
+    var pdfDisabled = g.broadsheetUnlocked ? '' : ' disabled';
+    var xlsDisabled = g.broadsheetUnlocked ? '' : ' disabled';
+
+    // Safe versions of the group key for HTML attributes and JS string literals
+    var gkEsc  = escHtml(gk);
+    var gkJs   = gk.replace(/'/g, "\\'");
+    // ID-safe version (spaces replaced with hyphens) for unique button IDs
+    var gkId   = gk.replace(/\s+/g, '-');
+
+    // ── Open card ────────────────────────────────────────────────────────────
+    html += '<div class="section-card">';
+    html += '<div class="section-title">' + gkEsc + '</div>';
+
+    // ── Content wrapper: adds 12px 16px padding inside the card ─────────────
+    html += '<div style="padding:12px 16px 4px;">';
+
+    if (g.error) {
+      // Show a warning banner if this group had a data-load error
+      html += '<div class="alert alert--warning" style="margin-bottom:8px;">' + escHtml(g.error) + '</div>';
+    } else {
+      // ── Three progress bars (Scores / PSQ / Remarks) ─────────────────────
+      // Each bar shows: label | track | percentage
+      // The percentage label is fixed-width 34px — always "xx%" fits cleanly.
+
+      html +=
+        '<div class="overview-progress-row">' +
+          '<span class="overview-label">Scores</span>' +
+          '<div class="overview-bar">' +
+            '<div class="overview-bar__fill' + (scorePct === 100 ? ' overview-bar__fill--full' : '') +
+              '" style="width:' + scorePct + '%"></div>' +
+          '</div>' +
+          '<span class="overview-pct">' + scorePct + '%</span>' +
+        '</div>' +
+        '<div class="overview-progress-row">' +
+          '<span class="overview-label">PSQ</span>' +
+          '<div class="overview-bar">' +
+            '<div class="overview-bar__fill' + (psqPct === 100 ? ' overview-bar__fill--full' : '') +
+              '" style="width:' + psqPct + '%"></div>' +
+          '</div>' +
+          '<span class="overview-pct">' + psqPct + '%</span>' +
+        '</div>' +
+        '<div class="overview-progress-row">' +
+          '<span class="overview-label">Remarks</span>' +
+          '<div class="overview-bar">' +
+            '<div class="overview-bar__fill' + (remPct === 100 ? ' overview-bar__fill--full' : '') +
+              '" style="width:' + remPct + '%"></div>' +
+          '</div>' +
+          '<span class="overview-pct">' + remPct + '%</span>' +
+        '</div>';
+
+      // ── Secondary count line — exact numbers for Scores ──────────────────
+      // Only shown when scores total > 0 so we don't show "0 / 0 entered"
+      if (scoresTotal > 0) {
+        html +=
+          '<div style="font-size:11px;color:var(--color-text-sec);margin-top:4px;margin-bottom:4px;">' +
+            scoresEntered + ' / ' + scoresTotal + ' score entries &nbsp;|&nbsp; ' +
+            psqComplete   + ' / ' + psqRequired + ' PSQ &nbsp;|&nbsp; ' +
+            remComplete   + ' / ' + remRequired + ' remarks' +
+          '</div>';
+      }
+    }
+
+    // ── Status badges ────────────────────────────────────────────────────────
+    html += '<div class="overview-badges" style="margin-top:10px;">' + bsBadge + resBadge + '</div>';
+
+    // Close content wrapper
+    html += '</div>';
+
+    // ── Export buttons ────────────────────────────────────────────────────────
+    // Rendered outside the padded wrapper so the border-top sits flush at the
+    // card edge with the same horizontal padding as the section-title above.
+    html +=
+      '<div class="overview-export-row" style="padding:10px 16px 12px;">' +
+        '<button class="overview-export-btn" id="pdf-btn-' + gkId + '"' + pdfDisabled +
+          ' onclick="overviewDownloadPDF(\'' + gkJs + '\', this)">' +
+          'PDF' +
+        '</button>' +
+        '<button class="overview-export-btn" id="xls-btn-' + gkId + '"' + xlsDisabled +
+          ' onclick="overviewDownloadExcel(\'' + gkJs + '\', this)">' +
+          'Excel' +
+        '</button>' +
+      '</div>';
+
+    html += '</div>'; // end section-card
+  });
+
+  html += '</div>'; // end page-content
+  body.innerHTML = html;
+}
+
+// ─── OVERVIEW EXPORT HANDLERS ─────────────────────────────────────────────────
+
+/**
+ * Download the broadsheet PDF for a class group from the overview screen.
+ * @param {string}      groupKey — e.g. "JSS 1"
+ * @param {HTMLElement} btn      — the clicked button (for loading state)
+ */
+function overviewDownloadPDF(groupKey, btn) {
+  if (btn) { btn.disabled = true; btn.textContent = 'Generating…'; }
+  google.script.run
+    .withSuccessHandler(function (result) {
+      if (btn) { btn.disabled = false; btn.textContent = 'PDF'; }
+      if (handleSessionExpired(result)) return;
+      if (!result || !result.success) {
+        showToast(result.error || 'PDF export failed.', 'error');
+        return;
+      }
+      downloadPdf(result.data.base64Pdf, result.data.filename);
+    })
+    .withFailureHandler(function () {
+      if (btn) { btn.disabled = false; btn.textContent = 'PDF'; }
+      showToast('Connection error. Try again.', 'error');
+    })
+    .serverGetBroadsheetPDF(App.token, groupKey);
+}
+
+/**
+ * Download the broadsheet Excel for a class group from the overview screen.
+ * @param {string}      groupKey
+ * @param {HTMLElement} btn
+ */
+function overviewDownloadExcel(groupKey, btn) {
+  if (btn) { btn.disabled = true; btn.textContent = 'Generating…'; }
+  google.script.run
+    .withSuccessHandler(function (result) {
+      if (btn) { btn.disabled = false; btn.textContent = 'Excel'; }
+      if (handleSessionExpired(result)) return;
+      if (!result || !result.success) {
+        showToast(result.error || 'Excel export failed.', 'error');
+        return;
+      }
+      downloadFile(
+        result.data.base64Excel,
+        result.data.filename,
+        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+      );
+    })
+    .withFailureHandler(function () {
+      if (btn) { btn.disabled = false; btn.textContent = 'Excel'; }
+      showToast('Connection error. Try again.', 'error');
+    })
+    .serverGetBroadsheetExcel(App.token, groupKey);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// BROADSHEET VIEW — Export bar injection
+// After the broadsheetView loads, we inject PDF + Excel download buttons.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Inject export buttons at the bottom of the broadsheetView after the
+ * Stage 5 init has finished rendering. Uses polling to detect when the
+ * loading placeholder has been replaced with real content.
+ *
+ * @param {{ groupKey: string }} params
+ */
+function initBroadsheetExportBar(params) {
+  var groupKey = params && params.groupKey;
+  if (!groupKey) return;
+
+  // Poll every 300ms (max 10 seconds) for the broadsheet table to appear.
+  // The Stage 5 init fetches data asynchronously — we wait for it to finish.
+  var attempts    = 0;
+  var maxAttempts = 33; // 33 × 300ms ≈ 10 seconds
+
+  var poll = setInterval(function () {
+    attempts++;
+    var app = document.getElementById('app');
+
+    // Stop if the user has navigated away
+    if (!app || App.currentView !== 'broadsheetView') {
+      clearInterval(poll);
+      return;
+    }
+
+    // Broadsheet table found — data has loaded, safe to inject export bar
+    var table = app.querySelector('.bs-table');
+    if (table) {
+      clearInterval(poll);
+      injectBroadsheetExportBar(groupKey, app);
+      return;
+    }
+
+    // Error state — loaded but failed, don't inject
+    var errMsg = app.querySelector('.alert--error, .empty-msg');
+    if (errMsg) {
+      clearInterval(poll);
+      return;
+    }
+
+    if (attempts >= maxAttempts) {
+      clearInterval(poll); // timed out
+    }
+  }, 300);
+}
+
+/**
+ * Physically inject the export bar HTML into the DOM.
+ * Called once the broadsheet table is detected in the DOM.
+ *
+ * @param {string}      groupKey
+ * @param {HTMLElement} app        — the #app element
+ */
+function injectBroadsheetExportBar(groupKey, app) {
+  // Guard: don't inject twice if init fires more than once
+  if (document.getElementById('broadsheet-export-bar')) return;
+
+  var gkJs = groupKey.replace(/'/g, "\\'");
+  var bar  = document.createElement('div');
+  bar.id        = 'broadsheet-export-bar';
+  bar.className = 'export-action-bar';
+  bar.innerHTML =
+    '<div class="export-action-bar__title">Export Broadsheet</div>' +
+    '<div class="export-action-bar__buttons">' +
+      '<button class="pdf-action-bar__btn pdf-action-bar__btn--primary" id="bs-pdf-btn" ' +
+        'onclick="downloadBroadsheetPDF(\'' + gkJs + '\', this)">' +
+        'PDF' +
+      '</button>' +
+      '<button class="pdf-action-bar__btn pdf-action-bar__btn--outline" id="bs-xls-btn" ' +
+        'onclick="downloadBroadsheetExcel(\'' + gkJs + '\', this)">' +
+        'Excel' +
+      '</button>' +
+    '</div>';
+
+  app.appendChild(bar);
+}
+
+// ─── BROADSHEET EXPORT DOWNLOAD FUNCTIONS ─────────────────────────────────────
+
+/**
+ * Download the broadsheet as a PDF from within the broadsheetView screen.
+ * @param {string}      groupKey
+ * @param {HTMLElement} btn
+ */
+function downloadBroadsheetPDF(groupKey, btn) {
+  if (btn) { btn.disabled = true; btn.textContent = 'Generating…'; }
+  google.script.run
+    .withSuccessHandler(function (result) {
+      if (btn) { btn.disabled = false; btn.textContent = 'PDF'; }
+      if (handleSessionExpired(result)) return;
+      if (!result || !result.success) {
+        showToast(result.error || 'PDF export failed.', 'error');
+        return;
+      }
+      downloadPdf(result.data.base64Pdf, result.data.filename);
+    })
+    .withFailureHandler(function () {
+      if (btn) { btn.disabled = false; btn.textContent = 'PDF'; }
+      showToast('Connection error. PDF not generated.', 'error');
+    })
+    .serverGetBroadsheetPDF(App.token, groupKey);
+}
+
+/**
+ * Download the broadsheet as an Excel file from within the broadsheetView screen.
+ * @param {string}      groupKey
+ * @param {HTMLElement} btn
+ */
+function downloadBroadsheetExcel(groupKey, btn) {
+  if (btn) { btn.disabled = true; btn.textContent = 'Generating…'; }
+  google.script.run
+    .withSuccessHandler(function (result) {
+      if (btn) { btn.disabled = false; btn.textContent = 'Excel'; }
+      if (handleSessionExpired(result)) return;
+      if (!result || !result.success) {
+        showToast(result.error || 'Excel export failed.', 'error');
+        return;
+      }
+      downloadFile(
+        result.data.base64Excel,
+        result.data.filename,
+        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+      );
+    })
+    .withFailureHandler(function () {
+      if (btn) { btn.disabled = false; btn.textContent = 'Excel'; }
+      showToast('Connection error. Excel not generated.', 'error');
+    })
+    .serverGetBroadsheetExcel(App.token, groupKey);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SUBJECT SCORE SHEET — Export bar injection (broadsheetSubjectDetail view)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Inject a "Download Score Sheet PDF" button into the broadsheetSubjectDetail
+ * view after it finishes loading.
+ *
+ * @param {{ groupKey: string, subjectId: string, subjectName: string }} params
+ */
+function initScoreSheetExportBar(params) {
+  var groupKey    = params && params.groupKey;
+  var subjectId   = params && params.subjectId;
+  var subjectName = params && params.subjectName;
+  if (!groupKey || !subjectId) return;
+
+  var attempts    = 0;
+  var maxAttempts = 33;
+
+  var poll = setInterval(function () {
+    attempts++;
+    var app = document.getElementById('app');
+
+    if (!app || App.currentView !== 'broadsheetSubjectDetail') {
+      clearInterval(poll);
+      return;
+    }
+
+    var table = app.querySelector('.bs-table');
+    if (table) {
+      clearInterval(poll);
+      injectScoreSheetExportBar(groupKey, subjectId, subjectName || 'Subject', app);
+      return;
+    }
+
+    var errMsg = app.querySelector('.alert--error, .empty-msg');
+    if (errMsg) { clearInterval(poll); return; }
+
+    if (attempts >= maxAttempts) clearInterval(poll);
+  }, 300);
+}
+
+/**
+ * Physically inject the score sheet export bar into the DOM.
+ *
+ * @param {string}      groupKey
+ * @param {string}      subjectId
+ * @param {string}      subjectName
+ * @param {HTMLElement} app
+ */
+function injectScoreSheetExportBar(groupKey, subjectId, subjectName, app) {
+  if (document.getElementById('scoresheet-export-bar')) return;
+
+  var gkJs  = groupKey.replace(/'/g, "\\'");
+  var sidJs = subjectId.replace(/'/g, "\\'");
+  var snJs  = subjectName.replace(/'/g, "\\'");
+
+  var bar = document.createElement('div');
+  bar.id        = 'scoresheet-export-bar';
+  bar.className = 'export-action-bar';
+  bar.innerHTML =
+    '<div class="export-action-bar__title">Export Score Sheet</div>' +
+    '<div class="export-action-bar__buttons">' +
+      '<button class="pdf-action-bar__btn pdf-action-bar__btn--primary" id="ss-pdf-btn" ' +
+        'onclick="downloadScoreSheetPDF(\'' + gkJs + '\',\'' + sidJs + '\',\'' + snJs + '\', this)">' +
+        'Download Score Sheet PDF' +
+      '</button>' +
+    '</div>';
+
+  app.appendChild(bar);
+}
+
+/**
+ * Download the score sheet PDF for a subject.
+ * @param {string}      groupKey
+ * @param {string}      subjectId
+ * @param {string}      subjectName  — used to name the file
+ * @param {HTMLElement} btn
+ */
+function downloadScoreSheetPDF(groupKey, subjectId, subjectName, btn) {
+  if (btn) { btn.disabled = true; btn.textContent = 'Generating…'; }
+  google.script.run
+    .withSuccessHandler(function (result) {
+      if (btn) { btn.disabled = false; btn.textContent = 'Download Score Sheet PDF'; }
+      if (handleSessionExpired(result)) return;
+      if (!result || !result.success) {
+        showToast(result.error || 'PDF export failed.', 'error');
+        return;
+      }
+      downloadPdf(result.data.base64Pdf, result.data.filename);
+    })
+    .withFailureHandler(function () {
+      if (btn) { btn.disabled = false; btn.textContent = 'Download Score Sheet PDF'; }
+      showToast('Connection error. PDF not generated.', 'error');
+    })
+    .serverGetScoreSheetPDF(App.token, groupKey, subjectId);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CARRY-FORWARD SECTION (Assignments view)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Called after the assignments view loads.
+ * Makes a non-blocking call to check if carry-forward is available.
+ * If it is, injects a carry-forward card above the existing assignment list.
+ */
+function initCarryForwardSection() {
+  google.script.run
+    .withSuccessHandler(function (result) {
+      if (handleSessionExpired(result)) return;
+      if (!result || !result.success) return; // silently ignore errors
+      if (!result.data.needed)        return; // current term already has assignments
+
+      var fromTerm    = result.data.fromTerm;
+      var fromSession = result.data.fromSession;
+      var fmCount     = (result.data.formMasterAssignments  || []).length;
+      var tsCount     = (result.data.teacherAssignments     || []).length;
+
+      // If there's no source period at all, there's nothing to copy
+      if (!fromTerm) return;
+
+      injectCarryForwardCard(fromTerm, fromSession, fmCount, tsCount);
+    })
+    .withFailureHandler(function () {
+      // Silently ignore — carry-forward is optional, not critical
+    })
+    .serverGetCarryForwardPreview(App.token);
+}
+
+/**
+ * Build and inject the carry-forward card at the top of the assignments view.
+ * The card shows a summary of what will be copied and a Confirm button.
+ *
+ * @param {string} fromTerm
+ * @param {string} fromSession
+ * @param {number} fmCount     — number of FM assignments to copy
+ * @param {number} tsCount     — number of TS assignments to copy
+ */
+function injectCarryForwardCard(fromTerm, fromSession, fmCount, tsCount) {
+  var pageContent = document.querySelector('.page-content');
+  if (!pageContent) return;
+  if (document.getElementById('carry-forward-card')) return; // already injected
+
+  var card = document.createElement('div');
+  card.id        = 'carry-forward-card';
+  card.className = 'card card--pad carry-forward-card';
+  card.innerHTML =
+    '<div class="carry-forward-card__icon">🔁</div>' +
+    '<div class="carry-forward-card__title">Carry Forward Assignments</div>' +
+    '<p class="carry-forward-card__body">' +
+      'No assignments exist for this term yet. ' +
+      'You can copy ' + tsCount + ' Teacher-Subject and ' + fmCount + ' Form Master ' +
+      'assignments from <strong>' + escHtml(fromTerm) + ' ' + escHtml(fromSession) + '</strong>.' +
+    '</p>' +
+    '<div id="carry-forward-alert" class="mb-sm"></div>' +
+    '<button class="btn btn--primary btn--full" id="carry-forward-btn" ' +
+      'onclick="submitCarryForward()">' +
+      '<span class="btn-text">Copy Assignments from Prior Term</span>' +
+      '<span class="spinner"></span>' +
+    '</button>';
+
+  // Insert at the very top of the page-content so it's the first thing seen
+  pageContent.insertBefore(card, pageContent.firstChild);
+}
+
+/**
+ * Execute carry-forward when the Admin clicks "Copy Assignments from Prior Term".
+ * On success, hides the carry-forward card and shows a toast + reloads lists.
+ */
+function submitCarryForward() {
+  var alertEl = document.getElementById('carry-forward-alert');
+  var btn     = document.getElementById('carry-forward-btn');
+  if (alertEl) alertEl.innerHTML = '';
+  setButtonLoading('carry-forward-btn', true);
+
+  google.script.run
+    .withSuccessHandler(function (result) {
+      setButtonLoading('carry-forward-btn', false);
+      if (handleSessionExpired(result)) return;
+
+      if (!result || !result.success) {
+        if (alertEl) alertEl.innerHTML =
+          '<div class="alert alert--error">' +
+          escHtml(result.error || 'Carry-forward failed.') + '</div>';
+        return;
+      }
+
+      var d = result.data;
+      showToast(
+        'Done! ' + d.tsCreated + ' TS + ' + d.fmCreated + ' FM assignments copied.' +
+        (d.tsSkipped + d.fmSkipped > 0
+          ? ' (' + (d.tsSkipped + d.fmSkipped) + ' duplicates skipped)'
+          : ''),
+        'success'
+      );
+
+      // Hide the card — carry-forward has been executed successfully
+      var card = document.getElementById('carry-forward-card');
+      if (card) card.style.display = 'none';
+
+      // Reload both assignment tabs so the new rows appear immediately
+      if (typeof initAssignments === 'function') initAssignments();
+    })
+    .withFailureHandler(function () {
+      setButtonLoading('carry-forward-btn', false);
+      if (alertEl) alertEl.innerHTML =
+        '<div class="alert alert--error">Connection error. Please try again.</div>';
+    })
+    .serverExecuteCarryForward(App.token);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DOWNLOAD HELPERS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Decode base64 bytes and trigger a browser download for non-PDF file types.
+ * (PDFs use the existing downloadPdf() helper from Stage 5.)
+ *
+ * Supports: Excel (.xlsx), CSV, and any other binary file type.
+ *
+ * @param {string} base64   — base64-encoded file bytes from the server
+ * @param {string} filename — suggested download filename (e.g. "JSS1_Broadsheet.xlsx")
+ * @param {string} mime     — MIME type (e.g. 'application/vnd.openxmlformats-...')
+ */
+function downloadFile(base64, filename, mime) {
+  try {
+    // Step 1: Decode the base64 string to binary bytes
+    var binary = atob(base64);
+    var bytes  = new Uint8Array(binary.length);
+    for (var i = 0; i < binary.length; i++) {
+      bytes[i] = binary.charCodeAt(i);
+    }
+
+    // Step 2: Create a Blob (in-memory file) with the correct MIME type
+    var blob = new Blob([bytes], { type: mime });
+
+    // Step 3: Create a temporary object URL pointing to the Blob
+    var url = URL.createObjectURL(blob);
+
+    // Step 4: Trigger the download by clicking a temporary <a> element
+    var a           = document.createElement('a');
+    a.href          = url;
+    a.download      = filename || 'export';
+    a.style.display = 'none';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+
+    // Step 5: Release the object URL after a short delay so the download can start
+    setTimeout(function () { URL.revokeObjectURL(url); }, 5000);
+
+  } catch (err) {
+    showToast('Could not save file: ' + (err.message || 'Unknown error'), 'error');
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// END OF STAGE 6 ADDITIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+</script>

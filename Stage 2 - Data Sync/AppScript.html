@@ -1,0 +1,2005 @@
+<script>
+/* ═══════════════════════════════════════════════════════════════════════════
+   HGUS Academic Result Management System — Client-Side SPA
+   Stage 2 — Data Sync: Session Settings, Classes & Subjects, Assignments
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+// ─── APPLICATION STATE ────────────────────────────────────────────────────────
+
+const App = {
+  token:           null,
+  user:            null,
+  settings:        null,
+  currentView:     null,
+  viewParams:      {},
+  inactivityTimer: null,
+  profileMenuOpen: false,
+  usernameCheckTimer: null
+};
+
+const TOKEN_KEY      = 'hgus_token';
+const INACTIVITY_MS  = 5 * 60 * 1000;
+
+// ─── INITIALISATION ───────────────────────────────────────────────────────────
+
+document.addEventListener('DOMContentLoaded', function () {
+  App.token = sessionStorage.getItem(TOKEN_KEY);
+  if (App.token) {
+    showLoading('Restoring your session…');
+    google.script.run
+      .withSuccessHandler(onSessionValidated)
+      .withFailureHandler(function () { onSessionValidated({ valid: false }); })
+      .serverValidateSession(App.token);
+  } else {
+    renderView('login');
+  }
+  setupInactivityTracking();
+});
+
+function onSessionValidated(result) {
+  hideLoading();
+  if (!result.valid) {
+    clearSession();
+    renderView('login');
+  } else {
+    App.user     = result.session;
+    App.settings = result.settings;
+    routeToHome();
+  }
+}
+
+// ─── ROUTING ──────────────────────────────────────────────────────────────────
+
+function routeToHome() {
+  if (App.user.forcePasswordChange) {
+    renderView('forceChangePassword');
+    return;
+  }
+  const role = App.user.role;
+  if (role === 'Super Admin' || role === 'Admin') {
+    renderView('adminHome');
+  } else {
+    renderView('teacherHome');
+  }
+}
+
+function renderView(view, params) {
+  App.currentView  = view;
+  App.viewParams   = params || {};
+  App.profileMenuOpen = false;
+
+  const app = document.getElementById('app');
+  const renderers = {
+    login:               Views.login,
+    forceChangePassword: Views.forceChangePassword,
+    adminHome:           Views.adminHome,
+    teacherHome:         Views.teacherHome,
+    userList:            Views.userList,
+    addUser:             Views.addUser,
+    editUser:            Views.editUser,
+    changePassword:      Views.changePassword,
+    // Stage 2
+    sessionSettings:     Views.sessionSettings,
+    classesSubjects:     Views.classesSubjects,
+    assignments:         Views.assignments
+  };
+
+  if (!renderers[view]) {
+    app.innerHTML = '<p style="padding:16px">Unknown view: ' + view + '</p>';
+    return;
+  }
+  app.innerHTML = renderers[view](App.viewParams);
+  initView(view, App.viewParams);
+  resetInactivityTimer();
+}
+
+function initView(view, params) {
+  const inits = {
+    userList:        initUserList,
+    addUser:         initAddUser,
+    editUser:        initEditUser,
+    sessionSettings: initSessionSettings,
+    classesSubjects: initClassesSubjects,
+    assignments:     initAssignments
+  };
+  if (inits[view]) inits[view](params);
+}
+
+// ─── SESSION MANAGEMENT ───────────────────────────────────────────────────────
+
+function saveSession(token, user, settings) {
+  App.token    = token;
+  App.user     = user;
+  App.settings = settings || App.settings;
+  sessionStorage.setItem(TOKEN_KEY, token);
+}
+
+function clearSession() {
+  App.token    = null;
+  App.user     = null;
+  App.settings = null;
+  sessionStorage.removeItem(TOKEN_KEY);
+}
+
+/**
+ * Central SESSION_EXPIRED guard — call this at the top of every
+ * withSuccessHandler that sends a token to the server.
+ *
+ * If the server returned { success: false, code: 'SESSION_EXPIRED' } this
+ * function clears the client session, navigates to the login screen, and
+ * returns true so the caller can bail out immediately with "return".
+ *
+ * If the response is anything else it does nothing and returns false,
+ * meaning the caller should continue with its normal logic.
+ *
+ * Usage pattern:
+ *   .withSuccessHandler(function (result) {
+ *     if (handleSessionExpired(result)) return;   // ← add this one line
+ *     ... rest of handler ...
+ *   })
+ *
+ * WHY this is needed:
+ *   Without this, a SESSION_EXPIRED response just shows an inline error
+ *   message in whatever alert element is on screen, leaving the user stuck
+ *   in a broken half-authenticated state instead of being sent to login.
+ *   See TESTING_CHANGE_LOG.md T2-12 for full context.
+ *
+ * @param {Object} result  The raw response from the server.
+ * @returns {boolean}      true if the session expired (caller should return).
+ */
+function handleSessionExpired(result) {
+  if (result && !result.success && result.code === 'SESSION_EXPIRED') {
+    clearSession();
+    renderView('login');
+    showToast('Your session has expired. Please log in again.', 'error');
+    return true;
+  }
+  return false;
+}
+
+function logout() {
+  closeProfileMenu();
+  const token = App.token;
+  clearSession();
+  if (token) google.script.run.serverLogout(token);
+  renderView('login');
+  showToast('You have been logged out.', 'default');
+}
+
+// ─── INACTIVITY TRACKING ──────────────────────────────────────────────────────
+
+function setupInactivityTracking() {
+  ['click', 'keydown', 'touchstart', 'scroll'].forEach(function (ev) {
+    document.addEventListener(ev, resetInactivityTimer, { passive: true });
+  });
+}
+
+function resetInactivityTimer() {
+  if (App.inactivityTimer) clearTimeout(App.inactivityTimer);
+  if (App.token) {
+    App.inactivityTimer = setTimeout(function () {
+      clearSession();
+      renderView('login');
+      showToast('You were logged out due to inactivity.', 'default');
+    }, INACTIVITY_MS);
+  }
+}
+
+// ─── LOADING OVERLAY ──────────────────────────────────────────────────────────
+
+function showLoading(msg) {
+  let overlay = document.getElementById('loading-overlay');
+  if (!overlay) {
+    overlay = document.createElement('div');
+    overlay.id = 'loading-overlay';
+    overlay.className = 'loading-overlay';
+    document.body.appendChild(overlay);
+  }
+  overlay.innerHTML =
+    '<div class="spinner spinner--blue"></div>' +
+    '<p>' + (msg || 'Loading…') + '</p>';
+  overlay.style.display = 'flex';
+}
+
+function hideLoading() {
+  const overlay = document.getElementById('loading-overlay');
+  if (overlay) overlay.style.display = 'none';
+}
+
+// ─── TOAST NOTIFICATIONS ──────────────────────────────────────────────────────
+
+function showToast(message, type) {
+  let container = document.getElementById('toast-container');
+  if (!container) {
+    container = document.createElement('div');
+    container.id = 'toast-container';
+    container.className = 'toast-container';
+    document.body.appendChild(container);
+  }
+  const toast = document.createElement('div');
+  toast.className = 'toast' +
+    (type === 'success' ? ' toast--success' : type === 'error' ? ' toast--error' : '');
+  toast.textContent = message;
+  container.appendChild(toast);
+  requestAnimationFrame(function () {
+    requestAnimationFrame(function () { toast.classList.add('toast--show'); });
+  });
+  setTimeout(function () {
+    toast.classList.remove('toast--show');
+    setTimeout(function () { if (container.contains(toast)) container.removeChild(toast); }, 300);
+  }, 3500);
+}
+
+// ─── HELPERS ──────────────────────────────────────────────────────────────────
+
+function escHtml(str) {
+  if (!str && str !== 0) return '';
+  return String(str)
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+function initials(name) {
+  if (!name) return '?';
+  const parts = String(name).trim().split(/\s+/);
+  return (parts[0][0] + (parts[1] ? parts[1][0] : '')).toUpperCase();
+}
+
+function roleBadge(role) {
+  const map = { 'Super Admin': 'super-admin', 'Admin': 'admin', 'Teacher': 'teacher' };
+  return '<span class="badge badge--' + (map[role] || 'teacher') + '">' + escHtml(role) + '</span>';
+}
+
+function statusBadge(status) {
+  const map = { 'Active': 'active', 'On Leave': 'on-leave', 'Resigned': 'resigned' };
+  return '<span class="badge badge--' + (map[status] || 'active') + '">' + escHtml(status) + '</span>';
+}
+
+function sessionLabel() {
+  if (!App.settings) return '';
+  const s = App.settings;
+  if (!s.activeSession && !s.activeTerm) return 'No session set';
+  return (s.activeSession || '') + (s.activeTerm ? ' · ' + s.activeTerm : '');
+}
+
+/**
+ * Format an ISO date-time string as "ddd, dd mmm, yyyy hh:mm"
+ * e.g. "2026-05-03T23:00:00.000Z" → "Sun, 03 May, 2026 23:00"
+ *
+ * Use this when the value genuinely has a meaningful time component
+ * (e.g. a timestamped log entry). For date-only fields like dateJoined,
+ * use formatDate() instead — otherwise the time always shows as 00:00
+ * because no time was recorded when the date was stored.
+ */
+function formatDateTime(isoStr) {
+  if (!isoStr) return '—';
+  const d = new Date(isoStr);
+  if (isNaN(d.getTime())) return String(isoStr);
+  const DAYS   = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+  const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  const ddd  = DAYS[d.getDay()];
+  const dd   = String(d.getDate()).padStart(2, '0');
+  const mmm  = MONTHS[d.getMonth()];
+  const yyyy = d.getFullYear();
+  const hh   = String(d.getHours()).padStart(2, '0');
+  const min  = String(d.getMinutes()).padStart(2, '0');
+  return ddd + ', ' + dd + ' ' + mmm + ', ' + yyyy + ' ' + hh + ':' + min;
+}
+
+/**
+ * Format an ISO date string as "ddd, dd mmm, yyyy" — no time component.
+ * e.g. "2026-05-03T23:00:00.000Z" → "Mon, 04 May, 2026"
+ *
+ * Use this for date-only fields (e.g. dateJoined) where the time portion
+ * is always 00:00 and would be meaningless to display.
+ */
+function formatDate(isoStr) {
+  if (!isoStr) return '—';
+  const d = new Date(isoStr);
+  if (isNaN(d.getTime())) return String(isoStr);
+  const DAYS   = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+  const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  const ddd  = DAYS[d.getDay()];
+  const dd   = String(d.getDate()).padStart(2, '0');
+  const mmm  = MONTHS[d.getMonth()];
+  const yyyy = d.getFullYear();
+  return ddd + ', ' + dd + ' ' + mmm + ', ' + yyyy;
+}
+
+function setButtonLoading(btnId, loading) {
+  const btn = document.getElementById(btnId);
+  if (!btn) return;
+  if (loading) { btn.classList.add('btn-loading'); btn.disabled = true; }
+  else         { btn.classList.remove('btn-loading'); btn.disabled = false; }
+}
+
+function showFieldError(fieldId, message) {
+  const field = document.getElementById(fieldId);
+  if (field) field.classList.add('error');
+  const hint = document.getElementById(fieldId + '-hint');
+  if (hint) { hint.textContent = message; hint.className = 'form-hint error'; }
+}
+
+function clearFieldError(fieldId) {
+  const field = document.getElementById(fieldId);
+  if (field) field.classList.remove('error');
+  const hint = document.getElementById(fieldId + '-hint');
+  if (hint) { hint.textContent = ''; hint.className = 'form-hint'; }
+}
+
+function showAlert(containerId, message, type) {
+  const container = document.getElementById(containerId);
+  if (!container) return;
+  container.innerHTML =
+    '<div class="alert alert--' + (type || 'error') + '">' +
+    '<span>' + escHtml(message) + '</span></div>';
+}
+
+function clearAlert(containerId) {
+  const container = document.getElementById(containerId);
+  if (container) container.innerHTML = '';
+}
+
+// ─── PROFILE MENU ─────────────────────────────────────────────────────────────
+
+function toggleProfileMenu() {
+  if (App.profileMenuOpen) closeProfileMenu();
+  else openProfileMenu();
+}
+
+function openProfileMenu() {
+  const existing = document.getElementById('profile-menu');
+  if (existing) existing.remove();
+  App.profileMenuOpen = true;
+  const isAdmin = App.user && (App.user.role === 'Admin' || App.user.role === 'Super Admin');
+  const menu = document.createElement('div');
+  menu.id = 'profile-menu';
+  menu.className = 'profile-menu';
+  menu.innerHTML =
+    '<div class="profile-menu__header">' +
+      '<div class="profile-menu__name">' + escHtml(App.user ? App.user.name : '') + '</div>' +
+      '<div class="profile-menu__role">' + escHtml(App.user ? App.user.role : '') +
+        ' · ' + escHtml(App.user ? App.user.staffId : '') + '</div>' +
+    '</div>' +
+    '<button class="profile-menu__item" onclick="goChangePassword()">🔑 Change Password</button>' +
+    (isAdmin ? '<button class="profile-menu__item" onclick="renderView(\'adminHome\')">🏠 Admin Home</button>' : '') +
+    '<button class="profile-menu__item profile-menu__item--danger" onclick="logout()">🚪 Log Out</button>';
+  document.querySelector('.app-bar') && document.querySelector('.app-bar').appendChild(menu);
+  setTimeout(function () {
+    document.addEventListener('click', function outsideClick(e) {
+      if (!menu.contains(e.target)) {
+        closeProfileMenu();
+        document.removeEventListener('click', outsideClick);
+      }
+    });
+  }, 0);
+}
+
+function closeProfileMenu() {
+  const menu = document.getElementById('profile-menu');
+  if (menu) menu.remove();
+  App.profileMenuOpen = false;
+}
+
+function goChangePassword() { closeProfileMenu(); renderView('changePassword'); }
+
+// ─── APP BAR TEMPLATE ─────────────────────────────────────────────────────────
+
+function appBarHtml(title, subtitle, showBack, backView) {
+  const user = App.user;
+  return (
+    '<div class="app-bar">' +
+      (showBack
+        ? '<button class="app-bar__back" onclick="renderView(\'' + backView + '\')" aria-label="Back">&#8592;</button>'
+        : '') +
+      '<div class="app-bar__title">' +
+        '<h1>' + escHtml(title) + '</h1>' +
+        (subtitle ? '<div class="subtitle">' + escHtml(subtitle) + '</div>' : '') +
+      '</div>' +
+      '<span class="session-badge">' + escHtml(sessionLabel()) + '</span>' +
+      '<button class="app-bar__avatar" onclick="toggleProfileMenu()" aria-label="Profile menu">' +
+        (user ? initials(user.name) : '?') +
+      '</button>' +
+    '</div>'
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// VIEWS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const Views = {};
+
+// ─── VIEW: LOGIN (Screen 1) ───────────────────────────────────────────────────
+
+Views.login = function () {
+  return (
+    '<div class="login-screen">' +
+      '<div class="login-logo">' +
+        '<span class="login-logo__icon">🎓</span>' +
+        '<h1>His Grace Universal Schools</h1>' +
+        '<p>Academic Result Management System</p>' +
+      '</div>' +
+      '<div class="login-card">' +
+        '<h2>Sign In</h2>' +
+        '<div id="login-alert"></div>' +
+        '<div class="form-group">' +
+          '<label class="form-label" for="login-username">Username</label>' +
+          '<input class="form-input" type="text" id="login-username" autocomplete="username" ' +
+            'autocapitalize="none" spellcheck="false" placeholder="Enter your username">' +
+        '</div>' +
+        '<div class="form-group">' +
+          '<label class="form-label" for="login-password">Password</label>' +
+          '<div class="input-wrapper">' +
+            '<input class="form-input form-input--icon" type="password" id="login-password" ' +
+              'autocomplete="current-password" placeholder="Enter your password">' +
+            '<button class="input-icon-btn" onclick="togglePwVisibility(\'login-password\',this)" ' +
+              'type="button" aria-label="Show/hide password">👁</button>' +
+          '</div>' +
+        '</div>' +
+        '<div id="login-error" class="mb-md"></div>' +
+        '<button class="btn btn--primary btn--full" id="login-btn" onclick="submitLogin()">' +
+          '<span class="btn-text">Sign In</span><span class="spinner"></span>' +
+        '</button>' +
+        '<p class="text-center text-xs text-muted mt-md">Forgot your password? Contact your administrator.</p>' +
+      '</div>' +
+    '</div>'
+  );
+};
+
+function togglePwVisibility(inputId, btn) {
+  const input = document.getElementById(inputId);
+  if (!input) return;
+  if (input.type === 'password') { input.type = 'text'; btn.textContent = '🙈'; }
+  else                           { input.type = 'password'; btn.textContent = '👁'; }
+}
+
+function submitLogin() {
+  const username = (document.getElementById('login-username').value || '').trim();
+  const password = document.getElementById('login-password').value || '';
+  clearAlert('login-error');
+  if (!username) { showAlert('login-error', 'Please enter your username.', 'error'); return; }
+  if (!password) { showAlert('login-error', 'Please enter your password.', 'error'); return; }
+  setButtonLoading('login-btn', true);
+  google.script.run
+    .withSuccessHandler(onLoginResult)
+    .withFailureHandler(function () {
+      setButtonLoading('login-btn', false);
+      showAlert('login-error', 'Connection error. Please try again.', 'error');
+    })
+    .serverLogin(username, password);
+}
+
+function onLoginResult(result) {
+  setButtonLoading('login-btn', false);
+  if (!result.success) { showAlert('login-error', result.error, 'error'); return; }
+  google.script.run
+    .withSuccessHandler(function (settingsResult) {
+      const settings = (settingsResult && settingsResult.success) ? settingsResult.data : {};
+      saveSession(result.token, result.user, settings);
+      if (result.forcePasswordChange) renderView('forceChangePassword');
+      else { routeToHome(); showToast('Welcome back, ' + result.user.name.split(' ')[0] + '!', 'success'); }
+    })
+    .withFailureHandler(function () {
+      saveSession(result.token, result.user, {});
+      if (result.forcePasswordChange) renderView('forceChangePassword');
+      else routeToHome();
+    })
+    .serverGetSessionSettings(result.token);
+}
+
+// ─── VIEW: FORCE CHANGE PASSWORD (Screen 1A) ──────────────────────────────────
+
+Views.forceChangePassword = function () {
+  const greeting = (App.user && App.user.role === 'Super Admin')
+    ? 'Welcome, Super Admin! Set your password to continue.'
+    : 'Welcome! You must set a new password before continuing.';
+  return (
+    '<div class="login-screen">' +
+      '<div class="login-logo"><span class="login-logo__icon">🔐</span><h1>Set Your Password</h1></div>' +
+      '<div class="login-card">' +
+        '<div class="alert alert--info mb-md">' + escHtml(greeting) + '</div>' +
+        '<div class="form-group">' +
+          '<label class="form-label" for="fcp-new">New Password</label>' +
+          '<div class="input-wrapper">' +
+            '<input class="form-input form-input--icon" type="password" id="fcp-new" autocomplete="new-password" placeholder="At least 8 characters">' +
+            '<button class="input-icon-btn" onclick="togglePwVisibility(\'fcp-new\',this)" type="button">👁</button>' +
+          '</div>' +
+          '<div class="form-hint" id="fcp-new-hint"></div>' +
+        '</div>' +
+        '<div class="form-group">' +
+          '<label class="form-label" for="fcp-confirm">Confirm Password</label>' +
+          '<div class="input-wrapper">' +
+            '<input class="form-input form-input--icon" type="password" id="fcp-confirm" autocomplete="new-password" placeholder="Re-enter your password">' +
+            '<button class="input-icon-btn" onclick="togglePwVisibility(\'fcp-confirm\',this)" type="button">👁</button>' +
+          '</div>' +
+          '<div class="form-hint" id="fcp-confirm-hint"></div>' +
+        '</div>' +
+        '<div id="fcp-alert" class="mb-md"></div>' +
+        '<button class="btn btn--primary btn--full" id="fcp-btn" onclick="submitForceChange()">' +
+          '<span class="btn-text">Set Password &amp; Continue</span><span class="spinner"></span>' +
+        '</button>' +
+      '</div>' +
+    '</div>'
+  );
+};
+
+function submitForceChange() {
+  const newPw  = document.getElementById('fcp-new').value    || '';
+  const confPw = document.getElementById('fcp-confirm').value || '';
+  clearAlert('fcp-alert'); clearFieldError('fcp-new'); clearFieldError('fcp-confirm');
+  if (newPw.length < 8) { showFieldError('fcp-new', 'Password must be at least 8 characters.'); return; }
+  if (newPw !== confPw)  { showFieldError('fcp-confirm', 'Passwords do not match.'); return; }
+  setButtonLoading('fcp-btn', true);
+  google.script.run
+    .withSuccessHandler(function (result) {
+      setButtonLoading('fcp-btn', false);
+      if (handleSessionExpired(result)) return;
+      if (!result.success) { showAlert('fcp-alert', result.error, 'error'); return; }
+      App.user.forcePasswordChange = false;
+      routeToHome();
+      showToast('Password set successfully!', 'success');
+    })
+    .withFailureHandler(function () {
+      setButtonLoading('fcp-btn', false);
+      showAlert('fcp-alert', 'Connection error. Please try again.', 'error');
+    })
+    .serverForceChangePassword(App.token, newPw, confPw);
+}
+
+// ─── VIEW: ADMIN HOME (Screen 11) ─────────────────────────────────────────────
+
+Views.adminHome = function () {
+  const role  = App.user ? App.user.role : 'Admin';
+  const name  = App.user ? App.user.name.split(' ')[0] : '';
+
+  const tiles = [
+    { icon: '👥', label: 'User List',           sub: 'Manage staff accounts',   view: 'userList'         },
+    { icon: '🏫', label: 'Classes & Subjects',  sub: 'Sync and manage data',    view: 'classesSubjects'  },
+    { icon: '📋', label: 'Manage Assignments',  sub: 'Form Masters & Teachers', view: 'assignments'      },
+    { icon: '⚙️', label: 'Session Settings',    sub: 'Active term, sync data',  view: 'sessionSettings'  },
+    { icon: '📊', label: 'Results Overview',    sub: 'All classes progress',    view: null, soon: true    },
+    { icon: '🗄️', label: 'Archive Session',    sub: 'End-of-year backup',      view: null, soon: true    }
+  ];
+
+  const tilesHtml = tiles.map(function (t) {
+    const onclick = t.soon
+      ? 'onclick="showToast(\'Coming in a later stage!\',\'default\')"'
+      : 'onclick="renderView(\'' + t.view + '\')"';
+    return (
+      '<button class="nav-tile' + (t.soon ? ' nav-tile--disabled' : '') + '" ' + onclick + '>' +
+        '<span class="nav-tile__icon">' + t.icon + '</span>' +
+        '<span class="nav-tile__label">' + escHtml(t.label) + '</span>' +
+        '<span class="nav-tile__sub">' + escHtml(t.sub) + (t.soon ? ' (coming soon)' : '') + '</span>' +
+      '</button>'
+    );
+  }).join('');
+
+  return (
+    appBarHtml('Good day, ' + name + '!', role + ' Panel', false) +
+    '<div class="section-header mt-sm">' + escHtml(sessionLabel()) + '</div>' +
+    '<div class="nav-tiles">' + tilesHtml + '</div>'
+  );
+};
+
+// ─── VIEW: TEACHER HOME — PLACEHOLDER (Stage 3) ───────────────────────────────
+
+Views.teacherHome = function () {
+  const name = App.user ? App.user.name.split(' ')[0] : '';
+  return (
+    appBarHtml('Good day, ' + name + '!', 'Teacher', false) +
+    '<div class="page-content">' +
+      '<div class="empty-state mt-lg">' +
+        '<div class="empty-state__icon">📚</div>' +
+        '<h3>Score Entry</h3>' +
+        '<p>Your assignment list and score entry screens are coming in Stage 3.</p>' +
+      '</div>' +
+    '</div>'
+  );
+};
+
+// ─── VIEW: SESSION SETTINGS (Screen 12) ───────────────────────────────────────
+
+Views.sessionSettings = function () {
+  const s = App.settings || {};
+  const termOptions = ['First Term', 'Second Term', 'Third Term'].map(function (t) {
+    return '<option value="' + t + '"' + (s.activeTerm === t ? ' selected' : '') + '>' + t + '</option>';
+  }).join('');
+
+  return (
+    appBarHtml('Session Settings', 'Active term & data sync', true, 'adminHome') +
+    '<div class="page-content">' +
+
+    // ── Settings form ────────────────────────────────────────────────────────
+    '<div class="card card--pad mb-md">' +
+      '<div class="section-header-inline">Academic Period</div>' +
+      '<div id="ss-alert" class="mb-md"></div>' +
+
+      '<div class="form-group">' +
+        '<label class="form-label" for="ss-session">Active Session</label>' +
+        '<input class="form-input" type="text" id="ss-session" placeholder="e.g. 2025/2026" value="' + escHtml(s.activeSession || '') + '">' +
+        '<div class="form-hint">Format: YYYY/YYYY (e.g. 2025/2026)</div>' +
+      '</div>' +
+
+      '<div class="form-group">' +
+        '<label class="form-label" for="ss-term">Active Term</label>' +
+        '<select class="form-select" id="ss-term">' + termOptions + '</select>' +
+      '</div>' +
+
+      '<div class="form-row">' +
+        '<div class="form-group" style="flex:1">' +
+          '<label class="form-label" for="ss-start">Term Start Date</label>' +
+          '<input class="form-input" type="date" id="ss-start" value="' + escHtml(s.termStartDate || '') + '">' +
+        '</div>' +
+        '<div class="form-group" style="flex:1">' +
+          '<label class="form-label" for="ss-end">Term End Date</label>' +
+          '<input class="form-input" type="date" id="ss-end" value="' + escHtml(s.termEndDate || '') + '">' +
+        '</div>' +
+      '</div>' +
+
+      '<div class="form-row">' +
+        '<div class="form-group" style="flex:1">' +
+          '<label class="form-label" for="ss-fee">Next Term Fee (₦)</label>' +
+          '<input class="form-input" type="text" id="ss-fee" placeholder="e.g. 45,000" value="' + escHtml(s.nextTermFee || '') + '">' +
+        '</div>' +
+        '<div class="form-group" style="flex:1">' +
+          '<label class="form-label" for="ss-resumption">Next Term Resumption</label>' +
+          '<input class="form-input" type="date" id="ss-resumption" value="' + escHtml(s.nextTermResumption || '') + '">' +
+        '</div>' +
+      '</div>' +
+
+      '<button class="btn btn--primary btn--full mt-sm" id="ss-save-btn" onclick="saveSessionSettings()">' +
+        '<span class="btn-text">Save Settings</span><span class="spinner"></span>' +
+      '</button>' +
+    '</div>' +
+
+    // ── External sheet ────────────────────────────────────────────────────────
+    '<div class="card card--pad mb-md">' +
+      '<div class="section-header-inline">External Student Data Sheet</div>' +
+      '<p class="text-sm text-muted mb-md">' +
+        'Enter the Google Spreadsheet ID of the school\'s student registration sheet. ' +
+        'This is the long ID in the URL: docs.google.com/spreadsheets/d/<strong>SPREADSHEET_ID</strong>/edit' +
+      '</p>' +
+      '<div class="form-group">' +
+        '<label class="form-label" for="ss-extid">External Sheet ID</label>' +
+        '<input class="form-input" type="text" id="ss-extid" placeholder="Paste the Spreadsheet ID here" ' +
+          'value="' + escHtml(s.externalSheetId || '') + '" autocapitalize="none" spellcheck="false">' +
+        '<div class="form-hint">The sheet must have a tab whose name contains "StudentData" with columns: Student ID, Full Name, Student Class, Gender, Action Flag.</div>' +
+      '</div>' +
+      '<button class="btn btn--secondary btn--full" id="ss-extid-save-btn" onclick="saveExternalSheetId()">' +
+        '<span class="btn-text">Save Sheet ID</span><span class="spinner"></span>' +
+      '</button>' +
+    '</div>' +
+
+    // ── Data sync actions ─────────────────────────────────────────────────────
+    '<div class="card card--pad mb-md">' +
+      '<div class="section-header-inline">Data Sync</div>' +
+      '<div id="ss-sync-result" class="mb-sm"></div>' +
+
+      '<div class="sync-action">' +
+        '<div>' +
+          '<div class="sync-action__title">Sync Classes</div>' +
+          '<div class="sync-action__desc">Reads JSS/SSS class names from the external sheet and adds any that are missing to the Classes list.</div>' +
+        '</div>' +
+        '<button class="btn btn--secondary" id="ss-sync-classes-btn" onclick="runSyncClasses()">' +
+          '<span class="btn-text">Sync</span><span class="spinner"></span>' +
+        '</button>' +
+      '</div>' +
+
+      '<div class="sync-action">' +
+        '<div>' +
+          '<div class="sync-action__title">Sync Subjects</div>' +
+          '<div class="sync-action__desc">Reads the Subjects Reference tab and creates class-subject assignments for the active session.</div>' +
+        '</div>' +
+        '<button class="btn btn--secondary" id="ss-sync-subjects-btn" onclick="runSyncSubjects()">' +
+          '<span class="btn-text">Sync</span><span class="spinner"></span>' +
+        '</button>' +
+      '</div>' +
+
+      '<div class="sync-action">' +
+        '<div>' +
+          '<div class="sync-action__title">Refresh Student List</div>' +
+          '<div class="sync-action__desc">Updates the student cache for all classes from the external sheet. Run after new students are added or classes change.</div>' +
+        '</div>' +
+        '<button class="btn btn--secondary" id="ss-refresh-students-btn" onclick="runRefreshStudents()">' +
+          '<span class="btn-text">Refresh</span><span class="spinner"></span>' +
+        '</button>' +
+      '</div>' +
+    '</div>' +
+
+    '</div>' // page-content
+  );
+};
+
+function initSessionSettings() {
+  // No async init needed — fields are pre-filled from App.settings
+}
+
+function saveSessionSettings() {
+  const session    = (document.getElementById('ss-session').value || '').trim();
+  const term       = document.getElementById('ss-term').value;
+  const startDate  = document.getElementById('ss-start').value;
+  const endDate    = document.getElementById('ss-end').value;
+  const fee        = (document.getElementById('ss-fee').value || '').trim();
+  const resumption = document.getElementById('ss-resumption').value;
+
+  clearAlert('ss-alert');
+  if (!session) { showAlert('ss-alert', 'Active Session is required (e.g. 2025/2026).', 'error'); return; }
+
+  const settings = {
+    activeSession:      session,
+    activeTerm:         term,
+    termStartDate:      startDate,
+    termEndDate:        endDate,
+    nextTermFee:        fee,
+    nextTermResumption: resumption
+  };
+
+  setButtonLoading('ss-save-btn', true);
+  google.script.run
+    .withSuccessHandler(function (result) {
+      setButtonLoading('ss-save-btn', false);
+      if (handleSessionExpired(result)) return;
+      if (!result.success) { showAlert('ss-alert', result.error, 'error'); return; }
+      App.settings = result.data;  // server returns updated settings
+      showToast('Session settings saved.', 'success');
+    })
+    .withFailureHandler(function () {
+      setButtonLoading('ss-save-btn', false);
+      showAlert('ss-alert', 'Connection error. Please try again.', 'error');
+    })
+    .serverSetSessionSettings(App.token, settings);
+}
+
+function saveExternalSheetId() {
+  const extId = (document.getElementById('ss-extid').value || '').trim();
+  if (!extId) { showToast('Please enter the External Sheet ID first.', 'error'); return; }
+  setButtonLoading('ss-extid-save-btn', true);
+  google.script.run
+    .withSuccessHandler(function (result) {
+      setButtonLoading('ss-extid-save-btn', false);
+      if (handleSessionExpired(result)) return;
+      if (!result.success) { showToast(result.error, 'error'); return; }
+      App.settings = result.data;
+      showToast('External Sheet ID saved.', 'success');
+    })
+    .withFailureHandler(function () {
+      setButtonLoading('ss-extid-save-btn', false);
+      showToast('Connection error. Please try again.', 'error');
+    })
+    .serverSetSessionSettings(App.token, { externalSheetId: extId });
+}
+
+function runSyncClasses() {
+  const extId = (App.settings && App.settings.externalSheetId) ||
+                (document.getElementById('ss-extid') ? document.getElementById('ss-extid').value.trim() : '');
+  if (!extId) {
+    showAlert('ss-sync-result', 'Please save the External Sheet ID first.', 'error');
+    return;
+  }
+  clearAlert('ss-sync-result');
+  setButtonLoading('ss-sync-classes-btn', true);
+  google.script.run
+    .withSuccessHandler(function (result) {
+      setButtonLoading('ss-sync-classes-btn', false);
+      if (handleSessionExpired(result)) return;
+      if (!result.success) { showAlert('ss-sync-result', result.error, 'error'); return; }
+      showAlert('ss-sync-result', result.data.message, 'success');
+    })
+    .withFailureHandler(function () {
+      setButtonLoading('ss-sync-classes-btn', false);
+      showAlert('ss-sync-result', 'Sync failed. Please try again.', 'error');
+    })
+    .serverSyncClasses(App.token, extId);
+}
+
+function runSyncSubjects() {
+  clearAlert('ss-sync-result');
+  if (!App.settings || !App.settings.activeSession) {
+    showAlert('ss-sync-result', 'Please save the active session first.', 'error');
+    return;
+  }
+  setButtonLoading('ss-sync-subjects-btn', true);
+  google.script.run
+    .withSuccessHandler(function (result) {
+      setButtonLoading('ss-sync-subjects-btn', false);
+      if (handleSessionExpired(result)) return;
+      if (!result.success) { showAlert('ss-sync-result', result.error, 'error'); return; }
+      showAlert('ss-sync-result', result.data.message, 'success');
+    })
+    .withFailureHandler(function () {
+      setButtonLoading('ss-sync-subjects-btn', false);
+      showAlert('ss-sync-result', 'Sync failed. Please try again.', 'error');
+    })
+    .serverSyncSubjects(App.token);
+}
+
+function runRefreshStudents() {
+  clearAlert('ss-sync-result');
+  setButtonLoading('ss-refresh-students-btn', true);
+  google.script.run
+    .withSuccessHandler(function (result) {
+      setButtonLoading('ss-refresh-students-btn', false);
+      if (handleSessionExpired(result)) return;
+      if (!result.success) { showAlert('ss-sync-result', result.error, 'error'); return; }
+      showAlert('ss-sync-result', result.data.message, 'success');
+    })
+    .withFailureHandler(function () {
+      setButtonLoading('ss-refresh-students-btn', false);
+      showAlert('ss-sync-result', 'Refresh failed. Please try again.', 'error');
+    })
+    .serverRefreshStudentCache(App.token, 'all');
+}
+
+// ─── VIEW: CLASSES & SUBJECTS ─────────────────────────────────────────────────
+
+Views.classesSubjects = function () {
+  return (
+    appBarHtml('Classes & Subjects', 'Synced data', true, 'adminHome') +
+    '<div class="tab-bar">' +
+      '<button class="tab-bar__tab tab-bar__tab--active" id="tab-classes" onclick="switchCSTab(\'classes\')">Classes</button>' +
+      '<button class="tab-bar__tab" id="tab-subjects" onclick="switchCSTab(\'subjects\')">Subjects</button>' +
+    '</div>' +
+    '<div id="cs-body">' +
+      '<div class="empty-state mt-lg">' +
+        '<div class="spinner spinner--blue" style="width:32px;height:32px;border-width:4px;margin:0 auto"></div>' +
+        '<p class="mt-md text-muted">Loading…</p>' +
+      '</div>' +
+    '</div>'
+  );
+};
+
+let _csClasses  = [];
+let _csSubjects = [];
+let _csActiveTab = 'classes';
+
+function initClassesSubjects() {
+  _csActiveTab = 'classes';
+  loadClassesAndSubjects();
+}
+
+function loadClassesAndSubjects() {
+  const body = document.getElementById('cs-body');
+  if (body) body.innerHTML =
+    '<div class="empty-state mt-lg">' +
+    '<div class="spinner spinner--blue" style="width:32px;height:32px;border-width:4px;margin:0 auto"></div>' +
+    '<p class="mt-md text-muted">Loading…</p></div>';
+
+  // Load both in parallel via sequential calls (GAS doesn't have true parallel client calls)
+  google.script.run
+    .withSuccessHandler(function (r1) {
+      if (handleSessionExpired(r1)) return;
+      _csClasses = (r1.success && r1.data) ? r1.data : [];
+      google.script.run
+        .withSuccessHandler(function (r2) {
+          if (handleSessionExpired(r2)) return;
+          _csSubjects = (r2.success && r2.data) ? r2.data : [];
+          renderCSTab(_csActiveTab);
+        })
+        .withFailureHandler(function () { _csSubjects = []; renderCSTab(_csActiveTab); })
+        .serverGetSubjects(App.token);
+    })
+    .withFailureHandler(function () { _csClasses = []; renderCSTab(_csActiveTab); })
+    .serverGetClasses(App.token);
+}
+
+function switchCSTab(tab) {
+  _csActiveTab = tab;
+  document.querySelectorAll('.tab-bar__tab').forEach(function (el) {
+    el.classList.toggle('tab-bar__tab--active', el.id === 'tab-' + tab);
+  });
+  renderCSTab(tab);
+}
+
+function renderCSTab(tab) {
+  const body = document.getElementById('cs-body');
+  if (!body) return;
+
+  if (tab === 'classes') {
+    if (_csClasses.length === 0) {
+      body.innerHTML =
+        '<div class="empty-state mt-lg">' +
+          '<div class="empty-state__icon">🏫</div>' +
+          '<h3>No Classes Yet</h3>' +
+          '<p>Go to Session Settings and tap <strong>Sync Classes</strong> to import them from the external sheet.</p>' +
+        '</div>';
+      return;
+    }
+    // Group by section
+    const jss = _csClasses.filter(function (c) { return c.section === 'JSS'; });
+    const sss = _csClasses.filter(function (c) { return c.section === 'SSS'; });
+    let html = '';
+    if (jss.length > 0) {
+      html += '<div class="section-header">JSS (' + jss.length + ')</div><div class="card" style="margin:0;border-radius:0">';
+      jss.forEach(function (c) {
+        html += '<div class="list-row list-row--no-action">' +
+          '<span class="list-row__name">' + escHtml(c.className) + '</span>' +
+          '<span class="badge badge--teacher">' + escHtml(c.classId) + '</span>' +
+        '</div>';
+      });
+      html += '</div>';
+    }
+    if (sss.length > 0) {
+      html += '<div class="section-header">SSS (' + sss.length + ')</div><div class="card" style="margin:0;border-radius:0">';
+      sss.forEach(function (c) {
+        const deptBadge = c.department !== 'N/A' ? ' <span class="badge badge--on-leave">' + escHtml(c.department) + '</span>' : '';
+        html += '<div class="list-row list-row--no-action">' +
+          '<span class="list-row__name">' + escHtml(c.className) + deptBadge + '</span>' +
+          '<span class="badge badge--teacher">' + escHtml(c.classId) + '</span>' +
+        '</div>';
+      });
+      html += '</div>';
+    }
+    body.innerHTML = html;
+
+  } else {
+    // Subjects tab
+    if (_csSubjects.length === 0) {
+      body.innerHTML =
+        '<div class="empty-state mt-lg">' +
+          '<div class="empty-state__icon">📚</div>' +
+          '<h3>No Subjects Yet</h3>' +
+          '<p>Go to Session Settings and tap <strong>Sync Subjects</strong> after syncing classes.</p>' +
+        '</div>';
+      return;
+    }
+    const jssSubj = _csSubjects.filter(function (s) { return s.section === 'JSS'; });
+    const sssSubj = _csSubjects.filter(function (s) { return s.section === 'SSS'; });
+    let html = '';
+    if (jssSubj.length > 0) {
+      html += '<div class="section-header">JSS Subjects (' + jssSubj.length + ')</div><div class="card" style="margin:0;border-radius:0">';
+      jssSubj.forEach(function (s) {
+        html += '<div class="list-row list-row--no-action">' +
+          '<span class="list-row__name">' + escHtml(s.subjectName) + '</span>' +
+          '<span class="badge badge--teacher">' + escHtml(s.subjectId) + '</span>' +
+        '</div>';
+      });
+      html += '</div>';
+    }
+    if (sssSubj.length > 0) {
+      html += '<div class="section-header">SSS Subjects (' + sssSubj.length + ')</div><div class="card" style="margin:0;border-radius:0">';
+      sssSubj.forEach(function (s) {
+        html += '<div class="list-row list-row--no-action">' +
+          '<span class="list-row__name">' + escHtml(s.subjectName) + '</span>' +
+          '<span class="badge badge--on-leave">' + escHtml(s.department) + '</span>' +
+        '</div>';
+      });
+      html += '</div>';
+    }
+    body.innerHTML = html;
+  }
+}
+
+// ─── VIEW: MANAGE ASSIGNMENTS ─────────────────────────────────────────────────
+
+Views.assignments = function () {
+  return (
+    appBarHtml('Manage Assignments', 'Form Masters & Teachers', true, 'adminHome') +
+    '<div class="tab-bar">' +
+      '<button class="tab-bar__tab tab-bar__tab--active" id="tab-fm" onclick="switchAssignTab(\'fm\')">Form Masters</button>' +
+      '<button class="tab-bar__tab" id="tab-ts" onclick="switchAssignTab(\'ts\')">Teacher Subjects</button>' +
+    '</div>' +
+    '<div id="assign-body">' +
+      '<div class="empty-state mt-lg">' +
+        '<div class="spinner spinner--blue" style="width:32px;height:32px;border-width:4px;margin:0 auto"></div>' +
+        '<p class="mt-md text-muted">Loading…</p>' +
+      '</div>' +
+    '</div>'
+  );
+};
+
+let _assignFM       = [];   // current FM assignments
+let _assignTS       = [];   // current TS assignments
+let _assignClasses  = [];
+let _assignSubjects = [];
+let _assignUsers    = [];
+let _assignActiveTab = 'fm';
+let _fmGroups       = {};   // groupKey → { label, classIds, classNames }
+let _assignCSA      = [];   // class-subject assignments (used to filter class list by subject)
+let _tsClassGroups  = {};   // groupKey → [classId, …] built by onTSSubjectChange, consumed by addTeacherAssignment
+
+function initAssignments() {
+  _assignActiveTab = 'fm';
+  loadAssignmentData();
+}
+
+function loadAssignmentData() {
+  setAssignBodyLoading();
+  // Load reference data then FM assignments
+  google.script.run
+    .withSuccessHandler(function (r) {
+      if (handleSessionExpired(r)) return;
+      _assignClasses  = (r.success && r.data) ? r.data : [];
+      google.script.run
+        .withSuccessHandler(function (r2) {
+          if (handleSessionExpired(r2)) return;
+          _assignSubjects = (r2.success && r2.data) ? r2.data : [];
+          google.script.run
+            .withSuccessHandler(function (r3) {
+              if (handleSessionExpired(r3)) return;
+              _assignUsers = (r3.success && r3.data) ? r3.data : [];
+              loadFMAssignments();
+            })
+            .withFailureHandler(function () { _assignUsers = []; loadFMAssignments(); })
+            .serverGetUserList(App.token);
+        })
+        .withFailureHandler(function () { _assignSubjects = []; loadFMAssignments(); })
+        .serverGetSubjects(App.token);
+    })
+    .withFailureHandler(function () { _assignClasses = []; renderAssignTab(_assignActiveTab); })
+    .serverGetClasses(App.token);
+}
+
+function loadFMAssignments() {
+  google.script.run
+    .withSuccessHandler(function (r) {
+      if (handleSessionExpired(r)) return;
+      _assignFM = (r.success && r.data) ? r.data : [];
+      loadTSAssignments();
+    })
+    .withFailureHandler(function () { _assignFM = []; loadTSAssignments(); })
+    .serverGetFormMasterAssignments(App.token);
+}
+
+function loadTSAssignments() {
+  google.script.run
+    .withSuccessHandler(function (r) {
+      if (handleSessionExpired(r)) return;
+      _assignTS = (r.success && r.data) ? r.data : [];
+      loadCSAssignments();
+    })
+    .withFailureHandler(function () { _assignTS = []; loadCSAssignments(); })
+    .serverGetTeacherAssignments(App.token);
+}
+
+function loadCSAssignments() {
+  const sessionFilter = (App.settings || {}).activeSession || null;
+  google.script.run
+    .withSuccessHandler(function (r) {
+      if (handleSessionExpired(r)) return;
+      _assignCSA = (r.success && r.data) ? r.data : [];
+      renderAssignTab(_assignActiveTab);
+    })
+    .withFailureHandler(function () { _assignCSA = []; renderAssignTab(_assignActiveTab); })
+    .serverGetClassSubjectAssignments(App.token, sessionFilter);
+}
+
+function setAssignBodyLoading() {
+  const body = document.getElementById('assign-body');
+  if (body) body.innerHTML =
+    '<div class="empty-state mt-lg">' +
+    '<div class="spinner spinner--blue" style="width:32px;height:32px;border-width:4px;margin:0 auto"></div>' +
+    '<p class="mt-md text-muted">Loading…</p></div>';
+}
+
+function switchAssignTab(tab) {
+  _assignActiveTab = tab;
+  document.querySelectorAll('.tab-bar__tab').forEach(function (el) {
+    el.classList.toggle('tab-bar__tab--active', el.id === 'tab-' + tab);
+  });
+  renderAssignTab(tab);
+}
+
+function renderAssignTab(tab) {
+  const body = document.getElementById('assign-body');
+  if (!body) return;
+
+  if (_assignClasses.length === 0) {
+    body.innerHTML =
+      '<div class="page-content"><div class="alert alert--info">' +
+      'No classes found. Go to Session Settings and run Sync Classes first.' +
+      '</div></div>';
+    return;
+  }
+
+  if (tab === 'fm') {
+    renderFMTab(body);
+  } else {
+    renderTSTab(body);
+  }
+}
+
+// ─── FORM MASTER GROUP HELPERS ───────────────────────────────────────────────
+
+/**
+ * Strip the department suffix from a class name to get the FM group label.
+ * "SSS 1 Science" → "SSS 1"   "SSS 2 Art" → "SSS 2"   "JSS 3" → "JSS 3"
+ */
+function getFMGroupKey(className) {
+  return className
+    .replace(/\s+(science|art|commerce|humanities|business)\s*$/i, '')
+    .trim();
+}
+
+/**
+ * Build the _fmGroups map from _assignClasses.
+ * Returns groups sorted JSS 1 → SSS 3 (then alphabetical for any extras).
+ */
+function buildFMGroups() {
+  const ORDER = ['JSS 1', 'JSS 2', 'JSS 3', 'SSS 1', 'SSS 2', 'SSS 3'];
+  const map = {};
+  _assignClasses.forEach(function (cls) {
+    const key = getFMGroupKey(cls.className);
+    if (!map[key]) map[key] = { label: key, classIds: [], classNames: [] };
+    map[key].classIds.push(cls.classId);
+    map[key].classNames.push(cls.className);
+  });
+  _fmGroups = map;
+  return Object.keys(map).sort(function (a, b) {
+    const ai = ORDER.indexOf(a), bi = ORDER.indexOf(b);
+    if (ai !== -1 && bi !== -1) return ai - bi;
+    if (ai !== -1) return -1;
+    if (bi !== -1) return 1;
+    return a.localeCompare(b);
+  }).map(function (k) { return map[k]; });
+}
+
+/** Convert a group label to a safe DOM id ("SSS 1" → "SSS_1"). */
+function fmDomKey(label) { return label.replace(/\s+/g, '_'); }
+
+// ─── FORM MASTER TAB ─────────────────────────────────────────────────────────
+
+function renderFMTab(body) {
+  const groups = buildFMGroups();
+
+  // classId → FM assignment lookup
+  const fmByClass = {};
+  _assignFM.forEach(function (a) { fmByClass[a.classId] = a; });
+
+  // Active teachers + admins for the selector
+  const teachers = _assignUsers.filter(function (u) {
+    return u.employmentStatus === 'Active' && (u.role === 'Teacher' || u.role === 'Admin');
+  });
+
+  let html = '<div class="page-content">';
+  html += '<p class="text-sm text-muted mb-md">Assign one Form Master per level for the active session (' +
+    escHtml((App.settings || {}).activeSession || 'not set') + '). ' +
+    'For SSS levels the same Form Master covers all departments.</p>';
+  html += '<div id="fm-alert" class="mb-md"></div>';
+
+  groups.forEach(function (group) {
+    const dk = fmDomKey(group.label);
+
+    // Use the first FM found in the group (all classes in a group share the same FM)
+    let existing = null;
+    for (let i = 0; i < group.classIds.length; i++) {
+      if (fmByClass[group.classIds[i]]) { existing = fmByClass[group.classIds[i]]; break; }
+    }
+    const selectedStaffId = existing ? existing.staffId : '';
+    const fullAccess = existing
+      ? (existing.grantedFullAccess === 'TRUE' || existing.grantedFullAccess === true)
+      : false;
+
+    const options = '<option value="">— Select teacher —</option>' +
+      teachers.map(function (u) {
+        return '<option value="' + escHtml(u.staffId) + '"' +
+          (u.staffId === selectedStaffId ? ' selected' : '') + '>' +
+          escHtml(u.name) + ' (' + escHtml(u.staffId) + ')</option>';
+      }).join('');
+
+    // Sub-label listing covered classes (only meaningful for SSS groups with departments)
+    const subLabel = group.classNames.length > 1
+      ? '<div class="text-xs text-muted mt-xs">Covers: ' + group.classNames.join(' · ') + '</div>'
+      : '';
+
+    html +=
+      '<div class="assign-card" id="fm-card-' + dk + '">' +
+        '<div class="assign-card__class">' +
+          '<div class="assign-card__class-name">' + escHtml(group.label) + '</div>' +
+          subLabel +
+        '</div>' +
+        '<div class="assign-card__body">' +
+          '<select class="form-select mb-sm" id="fm-staff-' + dk + '">' + options + '</select>' +
+          '<label class="d-flex align-center gap-sm mb-sm" style="cursor:pointer">' +
+            '<input type="checkbox" id="fm-full-' + dk + '"' + (fullAccess ? ' checked' : '') + '>' +
+            '<span class="text-sm">Grant full-class score entry access</span>' +
+          '</label>' +
+          '<div class="d-flex gap-sm">' +
+            '<button class="btn btn--secondary btn--sm" onclick="saveFormMaster(\'' + dk + '\')">' +
+              (existing ? 'Update' : 'Assign') +
+            '</button>' +
+            (existing
+              ? '<button class="btn btn--ghost btn--sm" onclick="removeFormMaster(\'' + dk + '\')">Remove</button>'
+              : '') +
+          '</div>' +
+        '</div>' +
+      '</div>';
+  });
+
+  html += '</div>';
+  body.innerHTML = html;
+}
+
+function saveFormMaster(domKey) {
+  clearAlert('fm-alert');
+  const groupLabel = domKey.replace(/_/g, ' ');
+  const group = _fmGroups[groupLabel];
+  if (!group) return;
+
+  const staffEl = document.getElementById('fm-staff-' + domKey);
+  const fullEl  = document.getElementById('fm-full-' + domKey);
+  if (!staffEl) return;
+
+  const staffId           = staffEl.value;
+  const grantedFullAccess = fullEl ? fullEl.checked : false;
+  if (!staffId) {
+    showAlert('fm-alert', 'Please select a teacher to assign as Form Master.', 'error');
+    return;
+  }
+
+  // Assign to every classId in the group, sequentially
+  const classIds = group.classIds.slice();
+  let idx = 0;
+  function assignNext() {
+    if (idx >= classIds.length) {
+      showToast('Form Master assigned for ' + groupLabel + '.', 'success');
+      google.script.run
+        .withSuccessHandler(function (r) {
+          if (handleSessionExpired(r)) return;
+          _assignFM = (r.success && r.data) ? r.data : [];
+          renderAssignTab('fm');
+        })
+        .serverGetFormMasterAssignments(App.token);
+      return;
+    }
+    const classId = classIds[idx++];
+    google.script.run
+      .withSuccessHandler(function (result) {
+        if (handleSessionExpired(result)) return;
+        if (!result.success) { showAlert('fm-alert', result.error, 'error'); return; }
+        assignNext();
+      })
+      .withFailureHandler(function () { showAlert('fm-alert', 'Connection error. Please try again.', 'error'); })
+      .serverSetFormMasterAssignment(App.token, { staffId: staffId, classId: classId, grantedFullAccess: grantedFullAccess });
+  }
+  assignNext();
+}
+
+function removeFormMaster(domKey) {
+  const groupLabel = domKey.replace(/_/g, ' ');
+  const group = _fmGroups[groupLabel];
+  if (!group) return;
+
+  if (!confirm('Remove the Form Master assignment for ' + groupLabel + '?')) return;
+
+  // Remove from every classId in the group, sequentially
+  const classIds = group.classIds.slice();
+  let idx = 0;
+  function removeNext() {
+    if (idx >= classIds.length) {
+      showToast('Form Master assignment removed.', 'success');
+      google.script.run
+        .withSuccessHandler(function (r) {
+          if (handleSessionExpired(r)) return;
+          _assignFM = (r.success && r.data) ? r.data : [];
+          renderAssignTab('fm');
+        })
+        .serverGetFormMasterAssignments(App.token);
+      return;
+    }
+    const classId = classIds[idx++];
+    google.script.run
+      .withSuccessHandler(function (r) {
+        if (handleSessionExpired(r)) return;
+        removeNext(); // ignore NOT_FOUND — continue
+      })
+      .withFailureHandler(function () { showToast('Connection error.', 'error'); })
+      .serverRemoveFormMasterAssignment(App.token, classId);
+  }
+  removeNext();
+}
+
+function renderTSTab(body) {
+  const settings = App.settings || {};
+  const teachers = _assignUsers.filter(function (u) {
+    return u.employmentStatus === 'Active' && (u.role === 'Teacher' || u.role === 'Admin');
+  });
+
+  const teacherOpts = '<option value="">— Select teacher —</option>' +
+    teachers.map(function (u) {
+      return '<option value="' + escHtml(u.staffId) + '">' + escHtml(u.name) + ' (' + escHtml(u.staffId) + ')</option>';
+    }).join('');
+
+  const subjectOpts = '<option value="">— Select subject —</option>' +
+    _assignSubjects.map(function (s) {
+      return '<option value="' + escHtml(s.subjectId) + '">' + escHtml(s.subjectName) + ' (' + escHtml(s.section) + ')</option>';
+    }).join('');
+
+  const termOpts = ['First Term', 'Second Term', 'Third Term'].map(function (t) {
+    return '<option value="' + t + '"' + (settings.activeTerm === t ? ' selected' : '') + '>' + t + '</option>';
+  }).join('');
+
+  let html = '<div class="page-content">';
+  html += '<p class="text-sm text-muted mb-md">Session: <strong>' + escHtml(settings.activeSession || 'not set') +
+    '</strong> · Term: <strong>' + escHtml(settings.activeTerm || 'not set') + '</strong></p>';
+  html += '<div id="ts-alert" class="mb-md"></div>';
+
+  // ── Add assignment form ────────────────────────────────────────────────────
+  html +=
+    '<div class="card card--pad mb-md">' +
+      '<div class="section-header-inline mb-sm">Add Assignment</div>' +
+
+      '<div class="form-group">' +
+        '<label class="form-label" for="ts-staff">Teacher</label>' +
+        '<select class="form-select" id="ts-staff">' + teacherOpts + '</select>' +
+      '</div>' +
+
+      '<div class="form-group">' +
+        '<label class="form-label" for="ts-subject">Subject</label>' +
+        '<select class="form-select" id="ts-subject" onchange="onTSSubjectChange()">' + subjectOpts + '</select>' +
+      '</div>' +
+
+      '<div class="form-group">' +
+        '<label class="form-label" for="ts-term">Term</label>' +
+        '<select class="form-select" id="ts-term" onchange="onTSSubjectChange()">' + termOpts + '</select>' +
+      '</div>' +
+
+      '<div class="form-group">' +
+        '<label class="form-label">Classes</label>' +
+        '<div id="ts-class-list" class="check-list">' +
+          '<div class="check-list__empty">Select a subject above to see available classes.</div>' +
+        '</div>' +
+        '<div class="form-hint">Only classes that offer the selected subject are shown.</div>' +
+      '</div>' +
+
+      '<button class="btn btn--primary btn--sm mt-xs" id="ts-add-btn" onclick="addTeacherAssignment()">' +
+        '<span class="btn-text">Add Assignment</span><span class="spinner"></span>' +
+      '</button>' +
+    '</div>';
+
+  // ── Existing assignments list ──────────────────────────────────────────────
+  // Deduplicate by staffId + subjectId + class-level group (SSS 1 Science/Art/Commerce → "SSS 1")
+  const _tsSeen    = {};
+  const _tsDisplay = [];
+  _assignTS.forEach(function (a) {
+    const groupKey = getFMGroupKey(a.className || '');
+    const key = (a.staffId || '') + '|' + (a.subjectId || '') + '|' + groupKey + '|' + (a.term || '');
+    if (!_tsSeen[key]) {
+      _tsSeen[key] = {
+        staffName:     a.staffName  || a.staffId,
+        subjectName:   a.subjectName || a.subjectId,
+        classGroup:    groupKey || (a.className || a.classId),
+        term:          a.term || '',
+        assignmentIds: [a.assignmentId]
+      };
+      _tsDisplay.push(_tsSeen[key]);
+    } else {
+      _tsSeen[key].assignmentIds.push(a.assignmentId);
+    }
+  });
+
+  if (_tsDisplay.length === 0) {
+    html +=
+      '<div class="empty-state mt-sm">' +
+        '<div class="empty-state__icon">📋</div>' +
+        '<h3>No Assignments Yet</h3>' +
+        '<p>Use the form above to assign teachers to subjects for the current term.</p>' +
+      '</div>';
+  } else {
+    html += '<div class="section-header">Current Assignments (' + _tsDisplay.length + ')</div>' +
+      '<div class="card" style="margin:0;border-radius:0">';
+    _tsDisplay.forEach(function (entry) {
+      const idsJson = escHtml(JSON.stringify(entry.assignmentIds));
+      html +=
+        '<div class="list-row list-row--no-action">' +
+          '<div class="list-row__info">' +
+            '<div class="list-row__name">' + escHtml(entry.staffName) + '</div>' +
+            '<div class="list-row__sub">' +
+              escHtml(entry.classGroup) + ' · ' + escHtml(entry.subjectName) +
+              (entry.term ? ' <span class="text-muted">(' + escHtml(entry.term) + ')</span>' : '') +
+            '</div>' +
+          '</div>' +
+          '<button class="btn btn--ghost btn--sm" ' +
+            'onclick="removeTeacherAssignmentGroup(' + idsJson + ')">Remove</button>' +
+        '</div>';
+    });
+    html += '</div>';
+  }
+
+  html += '</div>';
+  body.innerHTML = html;
+}
+
+// ─── TEACHER SUBJECT CLASS FILTER ─────────────────────────────────────────────
+
+function onTSSubjectChange() {
+  const subjectId    = document.getElementById('ts-subject') ? document.getElementById('ts-subject').value : '';
+  const selectedTerm = document.getElementById('ts-term')    ? document.getElementById('ts-term').value    : '';
+  const listEl = document.getElementById('ts-class-list');
+  if (!listEl) return;
+
+  _tsClassGroups = {};
+
+  if (!subjectId) {
+    listEl.innerHTML = '<div class="check-list__empty">Select a subject above to see available classes.</div>';
+    return;
+  }
+
+  // Step 1 — classes that offer this subject (from Class-Subject Assignments)
+  const csaClassIds = new Set(
+    _assignCSA
+      .filter(function (csa) { return csa.subjectId === subjectId; })
+      .map(function (csa) { return csa.classId; })
+  );
+
+  if (csaClassIds.size === 0) {
+    listEl.innerHTML =
+      '<div class="check-list__empty">No classes are assigned this subject. ' +
+      'Run Sync Subjects in Session Settings first.</div>';
+    return;
+  }
+
+  // Step 2 — group matching classes by level key (SSS 1 Science/Art/Commerce → "SSS 1")
+  const ORDER = ['JSS 1', 'JSS 2', 'JSS 3', 'SSS 1', 'SSS 2', 'SSS 3'];
+  const groupMap = {}; // groupKey → [classId, ...]
+  _assignClasses
+    .filter(function (c) { return csaClassIds.has(c.classId); })
+    .forEach(function (c) {
+      const key = getFMGroupKey(c.className);
+      if (!groupMap[key]) groupMap[key] = [];
+      groupMap[key].push(c.classId);
+    });
+
+  _tsClassGroups = groupMap; // expose for addTeacherAssignment
+
+  // Reverse map: classId → groupKey (needed for reliable "taken" detection)
+  const classToGroup = {};
+  Object.keys(groupMap).forEach(function (gk) {
+    groupMap[gk].forEach(function (cid) { classToGroup[cid] = gk; });
+  });
+
+  // Step 3 — which groups are already taken (any class in the group already assigned)?
+  const takenGroupMap = {}; // groupKey → existing TS assignment object
+  _assignTS
+    .filter(function (a) {
+      return a.subjectId === subjectId &&
+             (!selectedTerm || a.term === selectedTerm);
+    })
+    .forEach(function (a) {
+      const gk = classToGroup[a.classId];
+      if (gk && !takenGroupMap[gk]) takenGroupMap[gk] = a;
+    });
+
+  const groupKeys    = Object.keys(groupMap).sort(function (a, b) {
+    const ai = ORDER.indexOf(a), bi = ORDER.indexOf(b);
+    if (ai !== -1 && bi !== -1) return ai - bi;
+    if (ai !== -1) return -1;
+    if (bi !== -1) return 1;
+    return a.localeCompare(b);
+  });
+  const availableCount = groupKeys.filter(function (k) { return !takenGroupMap[k]; }).length;
+  const takenCount     = groupKeys.length - availableCount;
+
+  let selectAllLabel = 'Select all available';
+  if (availableCount > 0) selectAllLabel += ' (' + availableCount + ')';
+  if (takenCount > 0)     selectAllLabel += ' · ' + takenCount + ' already assigned';
+
+  let html =
+    '<label class="check-list__item check-list__item--all">' +
+      '<input type="checkbox" id="ts-select-all" onchange="toggleTSSelectAll(this.checked)"' +
+        (availableCount === 0 ? ' disabled' : '') + '>' +
+      '<span class="text-sm fw-bold">' + selectAllLabel + '</span>' +
+    '</label>';
+
+  groupKeys.forEach(function (key) {
+    const taken = takenGroupMap[key];
+    if (taken) {
+      html +=
+        '<label class="check-list__item check-list__item--taken">' +
+          '<input type="checkbox" disabled>' +
+          '<span class="text-sm">' + escHtml(key) + '</span>' +
+          '<span class="check-list__taken-label">' + escHtml(taken.staffName || taken.staffId) + '</span>' +
+        '</label>';
+    } else {
+      html +=
+        '<label class="check-list__item">' +
+          '<input type="checkbox" class="ts-cls-check" value="' + escHtml(key) + '">' +
+          '<span class="text-sm">' + escHtml(key) + '</span>' +
+        '</label>';
+    }
+  });
+
+  listEl.innerHTML = html;
+}
+
+function toggleTSSelectAll(checked) {
+  document.querySelectorAll('.ts-cls-check').forEach(function (el) { el.checked = checked; });
+}
+
+// ─── ADD / REMOVE TEACHER ASSIGNMENTS ─────────────────────────────────────────
+
+function addTeacherAssignment() {
+  clearAlert('ts-alert');
+  const staffId   = document.getElementById('ts-staff')   ? document.getElementById('ts-staff').value   : '';
+  const subjectId = document.getElementById('ts-subject') ? document.getElementById('ts-subject').value : '';
+  const term      = document.getElementById('ts-term')    ? document.getElementById('ts-term').value    : '';
+
+  if (!staffId || !subjectId || !term) {
+    showAlert('ts-alert', 'Please select Teacher, Subject and Term.', 'error');
+    return;
+  }
+
+  // Checkbox values are now groupKeys (e.g. "SSS 1") — expand to actual classIds
+  const checkedEls        = document.querySelectorAll('.ts-cls-check:checked');
+  const selectedGroupKeys = Array.from(checkedEls).map(function (el) { return el.value; });
+  if (selectedGroupKeys.length === 0) {
+    showAlert('ts-alert', 'Please select at least one class from the list.', 'error');
+    return;
+  }
+  const selectedClassIds = [];
+  selectedGroupKeys.forEach(function (key) {
+    (_tsClassGroups[key] || []).forEach(function (cid) { selectedClassIds.push(cid); });
+  });
+  if (selectedClassIds.length === 0) {
+    showAlert('ts-alert', 'No class IDs found for selected groups. Try reloading.', 'error');
+    return;
+  }
+
+  setButtonLoading('ts-add-btn', true);
+  let added = 0, skipped = 0, idx = 0;
+
+  function assignNext() {
+    if (idx >= selectedClassIds.length) {
+      setButtonLoading('ts-add-btn', false);
+      if (added > 0) {
+        const skipNote = skipped > 0 ? ' (' + skipped + ' already existed, skipped).' : '.';
+        showToast(added + ' assignment' + (added !== 1 ? 's' : '') + ' added' + skipNote, 'success');
+      } else {
+        showAlert('ts-alert', 'All selected assignments already exist for this term.', 'warning');
+      }
+      // Reload TS list
+      google.script.run
+        .withSuccessHandler(function (r) {
+          if (handleSessionExpired(r)) return;
+          _assignTS = (r.success && r.data) ? r.data : [];
+          renderAssignTab('ts');
+        })
+        .serverGetTeacherAssignments(App.token);
+      return;
+    }
+    const classId = selectedClassIds[idx++];
+    google.script.run
+      .withSuccessHandler(function (result) {
+        if (handleSessionExpired(result)) return;
+        if (!result.success) {
+          if (result.code === 'DUPLICATE') { skipped++; assignNext(); }
+          else { setButtonLoading('ts-add-btn', false); showAlert('ts-alert', result.error, 'error'); }
+        } else {
+          added++;
+          assignNext();
+        }
+      })
+      .withFailureHandler(function () {
+        setButtonLoading('ts-add-btn', false);
+        showAlert('ts-alert', 'Connection error. Please try again.', 'error');
+      })
+      .serverAddTeacherAssignment(App.token, { staffId: staffId, classId: classId, subjectId: subjectId, term: term });
+  }
+  assignNext();
+}
+
+function removeTeacherAssignmentGroup(assignmentIds) {
+  if (!confirm('Remove this assignment?')) return;
+  const ids = Array.isArray(assignmentIds) ? assignmentIds.slice() : [assignmentIds];
+  let idx = 0;
+
+  function removeNext() {
+    if (idx >= ids.length) {
+      // All removed — reload the list
+      showToast('Assignment removed.', 'success');
+      google.script.run
+        .withSuccessHandler(function (r) {
+          if (handleSessionExpired(r)) return;
+          _assignTS = (r.success && r.data) ? r.data : [];
+          renderAssignTab('ts');
+        })
+        .withFailureHandler(function () { renderAssignTab('ts'); })
+        .serverGetTeacherAssignments(App.token);
+      return;
+    }
+    const id = ids[idx++];
+    google.script.run
+      .withSuccessHandler(function (result) {
+        if (handleSessionExpired(result)) return;
+        if (!result.success) { showToast(result.error || 'Remove failed.', 'error'); return; }
+        removeNext();
+      })
+      .withFailureHandler(function () { showToast('Connection error.', 'error'); })
+      .serverRemoveTeacherAssignment(App.token, id);
+  }
+  removeNext();
+}
+
+// ─── VIEW: USER LIST (Screen 14) ──────────────────────────────────────────────
+
+Views.userList = function () {
+  return (
+    appBarHtml('User List', 'Staff accounts', true, 'adminHome') +
+    '<div class="search-bar">' +
+      '<input type="text" id="user-search" placeholder="Search by name or username…" oninput="filterUsers()">' +
+    '</div>' +
+    '<div id="user-list-body">' +
+      '<div class="empty-state mt-lg">' +
+        '<div class="spinner spinner--blue" style="width:32px;height:32px;border-width:4px;margin:0 auto"></div>' +
+        '<p class="mt-md text-muted">Loading users…</p>' +
+      '</div>' +
+    '</div>' +
+    '<button class="fab" onclick="renderView(\'addUser\')" aria-label="Add user" title="Add User">+</button>'
+  );
+};
+
+let _userListData = [];
+
+function initUserList() {
+  google.script.run
+    .withSuccessHandler(function (result) {
+      try {
+        if (handleSessionExpired(result)) return;
+        var body = document.getElementById('user-list-body');
+        if (!body) return;
+        if (!result || !result.success) {
+          body.innerHTML = '<div class="page-content"><div class="alert alert--error">' +
+            escHtml((result && result.error) || 'Could not load users.') + '</div></div>';
+          return;
+        }
+        _userListData = result.data || [];
+        renderUserList(_userListData);
+      } catch (e) {
+        var body = document.getElementById('user-list-body');
+        if (body) body.innerHTML = '<div class="page-content"><div class="alert alert--error">Display error: ' + escHtml(e.message) + '</div></div>';
+      }
+    })
+    .withFailureHandler(function (err) {
+      var body = document.getElementById('user-list-body');
+      if (!body) return;
+      body.innerHTML = '<div class="page-content"><div class="alert alert--error">' +
+        'Failed to load users: ' + escHtml((err && err.message) || 'Server error.') + '</div></div>';
+    })
+    .serverGetUserList(App.token);
+}
+
+function renderUserList(users) {
+  const body = document.getElementById('user-list-body');
+  if (!body) return;
+  if (!users || users.length === 0) {
+    body.innerHTML = '<div class="page-content"><div class="empty-state mt-lg"><div class="empty-state__icon">👤</div><h3>No Users Found</h3><p>Tap the + button to add the first staff account.</p></div></div>';
+    return;
+  }
+  const groups = [
+    { label: 'Super Admin', users: users.filter(function (u) { return u.role === 'Super Admin'; }) },
+    { label: 'Admin',       users: users.filter(function (u) { return u.role === 'Admin'; })       },
+    { label: 'Teachers',    users: users.filter(function (u) { return u.role === 'Teacher'; })     }
+  ].filter(function (g) { return g.users.length > 0; });
+
+  let html = '';
+  groups.forEach(function (group) {
+    html += '<div class="section-header">' + escHtml(group.label) + ' (' + group.users.length + ')</div>';
+    html += '<div class="card" style="margin:0;border-radius:0">';
+    group.users.forEach(function (user) {
+      const statusCls = user.employmentStatus === 'Resigned' ? ' style="opacity:.55"' : '';
+      html += '<div class="list-row" onclick="openUserProfile(\'' + escHtml(user.staffId) + '\')"' + statusCls + '>' +
+        '<div class="list-row__avatar">' + escHtml(initials(user.name)) + '</div>' +
+        '<div class="list-row__info">' +
+          '<div class="list-row__name">' + escHtml(user.name) + '</div>' +
+          '<div class="list-row__sub">' + escHtml(user.username) + ' · ' + escHtml(user.staffId) +
+            (user.employmentStatus !== 'Active' ? ' · ' + escHtml(user.employmentStatus) : '') +
+          '</div>' +
+        '</div>' +
+        roleBadge(user.role) +
+        '<span class="list-row__chevron">›</span>' +
+      '</div>';
+    });
+    html += '</div>';
+  });
+  body.innerHTML = html;
+}
+
+function filterUsers() {
+  const query = (document.getElementById('user-search').value || '').toLowerCase();
+  if (!query) { renderUserList(_userListData); return; }
+  renderUserList(_userListData.filter(function (u) {
+    return (u.name          || '').toLowerCase().includes(query) ||
+           (u.username      || '').toLowerCase().includes(query) ||
+           (u.staffId       || '').toLowerCase().includes(query) ||
+           (u.subjectSpecialty || '').toLowerCase().includes(query);
+  }));
+}
+
+function openUserProfile(staffId) { renderView('editUser', { staffId: staffId }); }
+
+// ─── VIEW: ADD USER (Screen 15) ───────────────────────────────────────────────
+
+Views.addUser = function () {
+  const isSA = App.user && App.user.role === 'Super Admin';
+  return (
+    appBarHtml('Add User', 'New staff account', true, 'userList') +
+    '<div class="page-content"><div class="card card--pad">' +
+      '<div id="adduser-alert" class="mb-md"></div>' +
+      '<div class="form-group"><label class="form-label" for="au-name">Full Name *</label>' +
+        '<input class="form-input" type="text" id="au-name" autocomplete="off" placeholder="e.g. Chukwuemeka Obi">' +
+        '<div class="form-hint error hidden" id="au-name-hint"></div></div>' +
+      '<div class="form-group"><label class="form-label" for="au-username">Username *</label>' +
+        '<input class="form-input" type="text" id="au-username" autocomplete="off" autocapitalize="none" placeholder="e.g. cobi_teacher">' +
+        '<div class="form-hint" id="au-username-hint">3–20 characters: letters, numbers, underscores.</div></div>' +
+      '<div class="form-group"><label class="form-label" for="au-password">Temporary Password *</label>' +
+        '<div class="input-wrapper">' +
+          '<input class="form-input form-input--icon" type="text" id="au-password" autocomplete="off" placeholder="At least 8 characters">' +
+          '<button class="input-icon-btn" onclick="togglePwVisibility(\'au-password\',this)" type="button">👁</button>' +
+        '</div><div class="form-hint" id="au-password-hint">Visible — share directly with the staff member.</div></div>' +
+      '<div class="form-group"><label class="form-label" for="au-email">Email</label>' +
+        '<input class="form-input" type="email" id="au-email" autocomplete="off" placeholder="Optional"></div>' +
+      '<div class="form-group"><label class="form-label" for="au-phone">Phone Number</label>' +
+        '<input class="form-input" type="tel" id="au-phone" placeholder="Optional"></div>' +
+      '<div class="form-group"><label class="form-label" for="au-specialty">Subject Specialty</label>' +
+        '<input class="form-input" type="text" id="au-specialty" placeholder="e.g. Mathematics, Physics"></div>' +
+      '<div class="form-group"><label class="form-label" for="au-status">Employment Status</label>' +
+        '<select class="form-select" id="au-status"><option value="Active">Active</option><option value="On Leave">On Leave</option></select></div>' +
+      (isSA ? '<div class="form-group"><label class="form-label" for="au-role">Role</label>' +
+        '<select class="form-select" id="au-role"><option value="Teacher">Teacher</option><option value="Admin">Admin</option></select></div>' : '') +
+      '<button class="btn btn--primary btn--full mt-md" id="au-btn" onclick="submitAddUser()">' +
+        '<span class="btn-text">Create Account</span><span class="spinner"></span></button>' +
+    '</div></div>'
+  );
+};
+
+function initAddUser() {
+  const usernameInput = document.getElementById('au-username');
+  if (!usernameInput) return;
+  usernameInput.addEventListener('input', function () {
+    clearTimeout(App.usernameCheckTimer);
+    const val = this.value.trim();
+    if (!val) {
+      document.getElementById('au-username-hint').textContent = '3–20 characters: letters, numbers, underscores.';
+      document.getElementById('au-username-hint').className = 'form-hint';
+      clearFieldError('au-username'); return;
+    }
+    App.usernameCheckTimer = setTimeout(function () {
+      google.script.run
+        .withSuccessHandler(function (result) {
+          const hint = document.getElementById('au-username-hint');
+          if (!hint) return;
+          if (result.available) {
+            hint.textContent = '✓ Username is available.'; hint.className = 'form-hint success'; clearFieldError('au-username');
+          } else {
+            hint.textContent = result.reason || 'Not available.'; hint.className = 'form-hint error';
+          }
+        })
+        .serverCheckUsername(val);
+    }, 400);
+  });
+}
+
+function submitAddUser() {
+  clearAlert('adduser-alert');
+  clearFieldError('au-name'); clearFieldError('au-username'); clearFieldError('au-password');
+  const name      = (document.getElementById('au-name').value || '').trim();
+  const username  = (document.getElementById('au-username').value || '').trim();
+  const password  = document.getElementById('au-password').value || '';
+  const email     = (document.getElementById('au-email')     ? document.getElementById('au-email').value    : '').trim();
+  const phone     = (document.getElementById('au-phone')     ? document.getElementById('au-phone').value    : '').trim();
+  const specialty = (document.getElementById('au-specialty') ? document.getElementById('au-specialty').value: '').trim();
+  const status    = document.getElementById('au-status') ? document.getElementById('au-status').value : 'Active';
+  const roleEl    = document.getElementById('au-role');
+  const role      = roleEl ? roleEl.value : 'Teacher';
+  let valid = true;
+  if (!name)                   { showFieldError('au-name', 'Full name is required.'); valid = false; }
+  if (!username)               { showFieldError('au-username', 'Username is required.'); valid = false; }
+  if (!password)               { showFieldError('au-password', 'Temporary password is required.'); valid = false; }
+  if (password && password.length < 8) { showFieldError('au-password', 'Password must be at least 8 characters.'); valid = false; }
+  if (!valid) return;
+  setButtonLoading('au-btn', true);
+  google.script.run
+    .withSuccessHandler(function (result) {
+      setButtonLoading('au-btn', false);
+      if (handleSessionExpired(result)) return;
+      if (!result.success) {
+        showAlert('adduser-alert', result.error, 'error');
+        if (result.code === 'USERNAME_TAKEN') showFieldError('au-username', result.error);
+        return;
+      }
+      showToast(result.data.message, 'success');
+      renderView('userList');
+    })
+    .withFailureHandler(function () {
+      setButtonLoading('au-btn', false);
+      showAlert('adduser-alert', 'Connection error. Please try again.', 'error');
+    })
+    .serverAddUser(App.token, { name, username, password, email, phoneNumber: phone, subjectSpecialty: specialty, employmentStatus: status, role });
+}
+
+// ─── VIEW: EDIT USER (Screen 16) ──────────────────────────────────────────────
+
+Views.editUser = function (params) {
+  return (
+    appBarHtml('User Profile', 'Loading…', true, 'userList') +
+    '<div class="page-content"><div id="edituser-body">' +
+      '<div class="empty-state mt-lg"><div class="spinner spinner--blue" style="width:32px;height:32px;border-width:4px;margin:0 auto"></div></div>' +
+    '</div></div>'
+  );
+};
+
+function initEditUser(params) {
+  const staffId = params && params.staffId;
+  if (!staffId) {
+    document.getElementById('edituser-body').innerHTML = '<div class="alert alert--error">No user selected.</div>';
+    return;
+  }
+  google.script.run
+    .withSuccessHandler(function (result) {
+      if (handleSessionExpired(result)) return;
+      if (!result.success) {
+        document.getElementById('edituser-body').innerHTML = '<div class="alert alert--error">' + escHtml(result.error) + '</div>';
+        return;
+      }
+      renderEditUserForm(result.data);
+    })
+    .withFailureHandler(function () {
+      document.getElementById('edituser-body').innerHTML = '<div class="alert alert--error">Failed to load user.</div>';
+    })
+    .serverGetUser(App.token, staffId);
+}
+
+function renderEditUserForm(user) {
+  const body = document.getElementById('edituser-body');
+  if (!body) return;
+  const h1 = document.querySelector('.app-bar h1');
+  if (h1) h1.textContent = user.name;
+  const subtitleEl = document.querySelector('.app-bar .subtitle');
+  if (subtitleEl) subtitleEl.textContent = user.role || 'Staff Profile';
+  const isSA        = App.user && App.user.role === 'Super Admin';
+  const isTargetSA  = user.role === 'Super Admin';
+  const isSelf      = App.user && App.user.staffId === user.staffId;
+  const canEditRole = isSA && !isSelf && !isTargetSA;
+  const statusOptions = ['Active', 'On Leave', 'Resigned'].map(function (s) {
+    return '<option value="' + s + '"' + (user.employmentStatus === s ? ' selected' : '') + '>' + s + '</option>';
+  }).join('');
+
+  body.innerHTML =
+    '<div id="edituser-alert" class="mb-md"></div>' +
+    // Summary card — name is intentionally omitted here because it is already
+    // displayed in the app bar banner above. Repeating it would be redundant.
+    '<div class="card card--pad mb-md">' +
+      '<div class="d-flex align-center justify-between mb-sm">' +
+        '<div class="text-xs text-muted">' + escHtml(user.staffId) + ' · ' + escHtml(user.username) + '</div>' +
+        roleBadge(user.role) +
+      '</div>' +
+      '<div class="text-xs text-muted">Added by: ' + escHtml(user.addedBy || '—') + ' · Joined: ' + formatDate(user.dateJoined) + '</div>' +
+    '</div>' +
+    '<div class="card card--pad">' +
+      '<div class="form-group"><label class="form-label">Full Name</label>' +
+        '<input class="form-input" type="text" id="eu-name" value="' + escHtml(user.name) + '"></div>' +
+      '<div class="form-group"><label class="form-label">Email</label>' +
+        '<input class="form-input" type="email" id="eu-email" value="' + escHtml(user.email || '') + '"></div>' +
+      '<div class="form-group"><label class="form-label">Phone Number</label>' +
+        '<input class="form-input" type="tel" id="eu-phone" value="' + escHtml(user.phoneNumber || '') + '"></div>' +
+      '<div class="form-group"><label class="form-label">Subject Specialty</label>' +
+        '<input class="form-input" type="text" id="eu-specialty" value="' + escHtml(user.subjectSpecialty || '') + '"></div>' +
+      '<div class="form-group"><label class="form-label">Employment Status</label>' +
+        '<select class="form-select" id="eu-status">' + statusOptions + '</select></div>' +
+      '<button class="btn btn--primary btn--full mt-md" id="eu-save-btn" onclick="submitEditUser(\'' + escHtml(user.staffId) + '\')">' +
+        '<span class="btn-text">Save Changes</span><span class="spinner"></span></button>' +
+    '</div>' +
+    '<div class="card card--pad mt-md">' +
+      '<div class="fw-bold mb-sm">Reset Password</div>' +
+      '<p class="text-sm text-muted mb-md">Set a new temporary password. User will be forced to change it on next login.</p>' +
+      '<div class="form-group"><label class="form-label">New Temporary Password</label>' +
+        '<input class="form-input" type="text" id="eu-new-temp-pw" placeholder="At least 8 characters">' +
+        '<div class="form-hint" id="eu-new-temp-pw-hint">Visible — share directly with the staff member.</div></div>' +
+      '<button class="btn btn--secondary btn--full" id="eu-reset-pw-btn" onclick="submitResetPassword(\'' + escHtml(user.staffId) + '\')">' +
+        '<span class="btn-text">Reset Password</span><span class="spinner"></span></button>' +
+    '</div>' +
+    (canEditRole
+      ? '<div class="card card--pad mt-md"><div class="fw-bold mb-sm">Change Role</div><div class="d-flex gap-sm">' +
+          (user.role !== 'Admin'
+            ? '<button class="btn btn--secondary" onclick="submitChangeRole(\'' + escHtml(user.staffId) + '\', \'Admin\')">Promote to Admin</button>'
+            : '<button class="btn btn--secondary" onclick="submitChangeRole(\'' + escHtml(user.staffId) + '\', \'Teacher\')">Demote to Teacher</button>') +
+        '</div></div>'
+      : '');
+}
+
+function submitEditUser(staffId) {
+  clearAlert('edituser-alert');
+  const updates = {
+    name:             (document.getElementById('eu-name')      ? document.getElementById('eu-name').value.trim()      : ''),
+    email:            (document.getElementById('eu-email')     ? document.getElementById('eu-email').value.trim()     : ''),
+    phoneNumber:      (document.getElementById('eu-phone')     ? document.getElementById('eu-phone').value.trim()     : ''),
+    subjectSpecialty: (document.getElementById('eu-specialty') ? document.getElementById('eu-specialty').value.trim() : ''),
+    employmentStatus: (document.getElementById('eu-status')    ? document.getElementById('eu-status').value           : '')
+  };
+  if (!updates.name) { showAlert('edituser-alert', 'Full name is required.', 'error'); return; }
+  setButtonLoading('eu-save-btn', true);
+  google.script.run
+    .withSuccessHandler(function (result) {
+      setButtonLoading('eu-save-btn', false);
+      if (handleSessionExpired(result)) return;
+      if (!result.success) { showAlert('edituser-alert', result.error, 'error'); return; }
+      showToast('User updated.', 'success'); renderView('userList');
+    })
+    .withFailureHandler(function () { setButtonLoading('eu-save-btn', false); showAlert('edituser-alert', 'Connection error.', 'error'); })
+    .serverUpdateUser(App.token, staffId, updates);
+}
+
+function submitResetPassword(staffId) {
+  const newPw = document.getElementById('eu-new-temp-pw') ? document.getElementById('eu-new-temp-pw').value : '';
+  if (!newPw || newPw.length < 8) { showFieldError('eu-new-temp-pw', 'Password must be at least 8 characters.'); return; }
+  clearFieldError('eu-new-temp-pw');
+  setButtonLoading('eu-reset-pw-btn', true);
+  google.script.run
+    .withSuccessHandler(function (result) {
+      setButtonLoading('eu-reset-pw-btn', false);
+      if (handleSessionExpired(result)) return;
+      if (!result.success) { showAlert('edituser-alert', result.error, 'error'); return; }
+      document.getElementById('eu-new-temp-pw').value = '';
+      showToast('Password reset. User will be prompted to change it.', 'success');
+    })
+    .withFailureHandler(function () { setButtonLoading('eu-reset-pw-btn', false); showAlert('edituser-alert', 'Connection error.', 'error'); })
+    .serverResetPassword(App.token, staffId, newPw);
+}
+
+function submitChangeRole(staffId, newRole) {
+  if (!confirm('Change this user\'s role to "' + newRole + '"?')) return;
+  google.script.run
+    .withSuccessHandler(function (result) {
+      if (handleSessionExpired(result)) return;
+      if (!result.success) { showToast(result.error, 'error'); return; }
+      showToast(result.data.message, 'success'); renderView('userList');
+    })
+    .withFailureHandler(function () { showToast('Connection error.', 'error'); })
+    .serverChangeRole(App.token, staffId, newRole);
+}
+
+// ─── VIEW: VOLUNTARY CHANGE PASSWORD (Screen 17) ─────────────────────────────
+
+Views.changePassword = function () {
+  const back = (App.user && (App.user.role === 'Super Admin' || App.user.role === 'Admin'))
+    ? 'adminHome' : 'teacherHome';
+  return (
+    appBarHtml('Change Password', 'Update your password', true, back) +
+    '<div class="page-content"><div class="card card--pad">' +
+      '<div id="cp-alert" class="mb-md"></div>' +
+      '<div class="form-group"><label class="form-label" for="cp-current">Current Password</label>' +
+        '<div class="input-wrapper"><input class="form-input form-input--icon" type="password" id="cp-current" autocomplete="current-password" placeholder="Your current password">' +
+        '<button class="input-icon-btn" onclick="togglePwVisibility(\'cp-current\',this)" type="button">👁</button></div>' +
+        '<div class="form-hint error hidden" id="cp-current-hint"></div></div>' +
+      '<div class="form-group"><label class="form-label" for="cp-new">New Password</label>' +
+        '<div class="input-wrapper"><input class="form-input form-input--icon" type="password" id="cp-new" autocomplete="new-password" placeholder="At least 8 characters">' +
+        '<button class="input-icon-btn" onclick="togglePwVisibility(\'cp-new\',this)" type="button">👁</button></div>' +
+        '<div class="form-hint error hidden" id="cp-new-hint"></div></div>' +
+      '<div class="form-group"><label class="form-label" for="cp-confirm">Confirm New Password</label>' +
+        '<div class="input-wrapper"><input class="form-input form-input--icon" type="password" id="cp-confirm" autocomplete="new-password" placeholder="Re-enter your new password">' +
+        '<button class="input-icon-btn" onclick="togglePwVisibility(\'cp-confirm\',this)" type="button">👁</button></div>' +
+        '<div class="form-hint error hidden" id="cp-confirm-hint"></div></div>' +
+      '<button class="btn btn--primary btn--full mt-md" id="cp-btn" onclick="submitChangePassword()">' +
+        '<span class="btn-text">Update Password</span><span class="spinner"></span></button>' +
+    '</div></div>'
+  );
+};
+
+function submitChangePassword() {
+  clearAlert('cp-alert'); clearFieldError('cp-current'); clearFieldError('cp-new'); clearFieldError('cp-confirm');
+  const current = document.getElementById('cp-current').value || '';
+  const newPw   = document.getElementById('cp-new').value     || '';
+  const conf    = document.getElementById('cp-confirm').value  || '';
+  let valid = true;
+  if (!current)          { showFieldError('cp-current', 'Current password is required.'); valid = false; }
+  if (newPw.length < 8)  { showFieldError('cp-new', 'Password must be at least 8 characters.'); valid = false; }
+  if (newPw !== conf)    { showFieldError('cp-confirm', 'Passwords do not match.'); valid = false; }
+  if (!valid) return;
+  setButtonLoading('cp-btn', true);
+  google.script.run
+    .withSuccessHandler(function (result) {
+      setButtonLoading('cp-btn', false);
+      if (handleSessionExpired(result)) return;
+      if (!result.success) {
+        if (result.code === 'WRONG_PASSWORD') showFieldError('cp-current', 'Current password is incorrect.');
+        else showAlert('cp-alert', result.error, 'error');
+        return;
+      }
+      showToast('Password changed successfully.', 'success');
+      const back = (App.user && (App.user.role === 'Super Admin' || App.user.role === 'Admin')) ? 'adminHome' : 'teacherHome';
+      renderView(back);
+    })
+    .withFailureHandler(function () { setButtonLoading('cp-btn', false); showAlert('cp-alert', 'Connection error. Please try again.', 'error'); })
+    .serverChangePassword(App.token, current, newPw, conf);
+}
+</script>

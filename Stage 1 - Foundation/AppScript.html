@@ -1,0 +1,1193 @@
+<script>
+/* ═══════════════════════════════════════════════════════════════════════════
+   HGUS Academic Result Management System — Client-Side SPA
+   Stage 1 — Foundation: Auth + User Management
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+// ─── APPLICATION STATE ────────────────────────────────────────────────────────
+
+const App = {
+  token:          null,   // session token (stored in sessionStorage)
+  user:           null,   // { staffId, name, username, role, forcePasswordChange }
+  settings:       null,   // { activeSession, activeTerm, ... }
+  currentView:    null,
+  viewParams:     {},
+  inactivityTimer: null,
+  profileMenuOpen: false,
+  usernameCheckTimer: null
+};
+
+const TOKEN_KEY = 'hgus_token';
+const INACTIVITY_MS = 5 * 60 * 1000; // 5 minutes
+
+// ─── INITIALISATION ───────────────────────────────────────────────────────────
+
+document.addEventListener('DOMContentLoaded', function () {
+  App.token = sessionStorage.getItem(TOKEN_KEY);
+  if (App.token) {
+    showLoading('Restoring your session…');
+    google.script.run
+      .withSuccessHandler(onSessionValidated)
+      .withFailureHandler(function () { onSessionValidated({ valid: false }); })
+      .serverValidateSession(App.token);
+  } else {
+    renderView('login');
+  }
+  setupInactivityTracking();
+});
+
+function onSessionValidated(result) {
+  hideLoading();
+  if (!result.valid) {
+    clearSession();
+    renderView('login');
+  } else {
+    App.user     = result.session;
+    App.settings = result.settings;
+    routeToHome();
+  }
+}
+
+// ─── ROUTING ──────────────────────────────────────────────────────────────────
+
+function routeToHome() {
+  if (App.user.forcePasswordChange) {
+    renderView('forceChangePassword');
+    return;
+  }
+  const role = App.user.role;
+  if (role === 'Super Admin' || role === 'Admin') {
+    renderView('adminHome');
+  } else {
+    renderView('teacherHome');
+  }
+}
+
+function renderView(view, params) {
+  App.currentView = view;
+  App.viewParams  = params || {};
+  App.profileMenuOpen = false;
+
+  const app = document.getElementById('app');
+  const renderers = {
+    login:                Views.login,
+    forceChangePassword:  Views.forceChangePassword,
+    adminHome:            Views.adminHome,
+    teacherHome:          Views.teacherHome,
+    userList:             Views.userList,
+    addUser:              Views.addUser,
+    editUser:             Views.editUser,
+    changePassword:       Views.changePassword
+  };
+
+  if (!renderers[view]) {
+    app.innerHTML = '<p style="padding:16px">Unknown view: ' + view + '</p>';
+    return;
+  }
+  app.innerHTML = renderers[view](App.viewParams);
+  initView(view, App.viewParams);
+  resetInactivityTimer();
+}
+
+function initView(view, params) {
+  // View-specific initialisation after render
+  const inits = {
+    userList:  initUserList,
+    addUser:   initAddUser,
+    editUser:  initEditUser
+  };
+  if (inits[view]) inits[view](params);
+}
+
+// ─── SESSION MANAGEMENT ───────────────────────────────────────────────────────
+
+function saveSession(token, user, settings) {
+  App.token    = token;
+  App.user     = user;
+  App.settings = settings || App.settings;
+  sessionStorage.setItem(TOKEN_KEY, token);
+}
+
+function clearSession() {
+  App.token    = null;
+  App.user     = null;
+  App.settings = null;
+  sessionStorage.removeItem(TOKEN_KEY);
+}
+
+function logout() {
+  closeProfileMenu();
+  const token = App.token;
+  clearSession();
+  if (token) {
+    google.script.run.serverLogout(token);
+  }
+  renderView('login');
+  showToast('You have been logged out.', 'default');
+}
+
+// ─── INACTIVITY TRACKING ──────────────────────────────────────────────────────
+
+function setupInactivityTracking() {
+  ['click', 'keydown', 'touchstart', 'scroll'].forEach(event => {
+    document.addEventListener(event, resetInactivityTimer, { passive: true });
+  });
+}
+
+function resetInactivityTimer() {
+  if (App.inactivityTimer) clearTimeout(App.inactivityTimer);
+  if (App.token) {
+    App.inactivityTimer = setTimeout(function () {
+      clearSession();
+      renderView('login');
+      showToast('You were logged out due to inactivity.', 'default');
+    }, INACTIVITY_MS);
+  }
+}
+
+// ─── LOADING OVERLAY ──────────────────────────────────────────────────────────
+
+function showLoading(msg) {
+  let overlay = document.getElementById('loading-overlay');
+  if (!overlay) {
+    overlay = document.createElement('div');
+    overlay.id = 'loading-overlay';
+    overlay.className = 'loading-overlay';
+    document.body.appendChild(overlay);
+  }
+  overlay.innerHTML =
+    '<div class="spinner spinner--blue"></div>' +
+    '<p>' + (msg || 'Loading…') + '</p>';
+  overlay.style.display = 'flex';
+}
+
+function hideLoading() {
+  const overlay = document.getElementById('loading-overlay');
+  if (overlay) overlay.style.display = 'none';
+}
+
+// ─── TOAST NOTIFICATIONS ──────────────────────────────────────────────────────
+
+function showToast(message, type) {
+  let container = document.getElementById('toast-container');
+  if (!container) {
+    container = document.createElement('div');
+    container.id = 'toast-container';
+    container.className = 'toast-container';
+    document.body.appendChild(container);
+  }
+  const toast = document.createElement('div');
+  toast.className = 'toast' +
+    (type === 'success' ? ' toast--success' : type === 'error' ? ' toast--error' : '');
+  toast.textContent = message;
+  container.appendChild(toast);
+  requestAnimationFrame(function () {
+    requestAnimationFrame(function () {
+      toast.classList.add('toast--show');
+    });
+  });
+  setTimeout(function () {
+    toast.classList.remove('toast--show');
+    setTimeout(function () { container.removeChild(toast); }, 300);
+  }, 3500);
+}
+
+// ─── HELPERS ──────────────────────────────────────────────────────────────────
+
+function escHtml(str) {
+  if (!str && str !== 0) return '';
+  return String(str)
+    .replace(/&/g,'&amp;')
+    .replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;');
+}
+
+function initials(name) {
+  if (!name) return '?';
+  const parts = String(name).trim().split(/\s+/);
+  return (parts[0][0] + (parts[1] ? parts[1][0] : '')).toUpperCase();
+}
+
+function roleBadge(role) {
+  const map = {
+    'Super Admin': 'super-admin',
+    'Admin':       'admin',
+    'Teacher':     'teacher'
+  };
+  const cls = map[role] || 'teacher';
+  return '<span class="badge badge--' + cls + '">' + escHtml(role) + '</span>';
+}
+
+function statusBadge(status) {
+  const map = {
+    'Active':   'active',
+    'On Leave': 'on-leave',
+    'Resigned': 'resigned'
+  };
+  const cls = map[status] || 'active';
+  return '<span class="badge badge--' + cls + '">' + escHtml(status) + '</span>';
+}
+
+function sessionLabel() {
+  if (!App.settings) return '';
+  const s = App.settings;
+  if (!s.activeSession && !s.activeTerm) return 'No session set';
+  return (s.activeSession || '') + (s.activeTerm ? ' · ' + s.activeTerm : '');
+}
+
+function setButtonLoading(btnId, loading) {
+  const btn = document.getElementById(btnId);
+  if (!btn) return;
+  if (loading) {
+    btn.classList.add('btn-loading');
+    btn.disabled = true;
+  } else {
+    btn.classList.remove('btn-loading');
+    btn.disabled = false;
+  }
+}
+
+function showFieldError(fieldId, message) {
+  const field = document.getElementById(fieldId);
+  if (field) field.classList.add('error');
+  const hint = document.getElementById(fieldId + '-hint');
+  if (hint) {
+    hint.textContent = message;
+    hint.className = 'form-hint error';
+  }
+}
+
+function clearFieldError(fieldId) {
+  const field = document.getElementById(fieldId);
+  if (field) field.classList.remove('error');
+  const hint = document.getElementById(fieldId + '-hint');
+  if (hint) {
+    hint.textContent = '';
+    hint.className = 'form-hint';
+  }
+}
+
+function showAlert(containerId, message, type) {
+  const container = document.getElementById(containerId);
+  if (!container) return;
+  container.innerHTML =
+    '<div class="alert alert--' + (type || 'error') + '">' +
+    '<span>' + escHtml(message) + '</span>' +
+    '</div>';
+}
+
+function clearAlert(containerId) {
+  const container = document.getElementById(containerId);
+  if (container) container.innerHTML = '';
+}
+
+// ─── PROFILE MENU ─────────────────────────────────────────────────────────────
+
+function toggleProfileMenu() {
+  if (App.profileMenuOpen) {
+    closeProfileMenu();
+  } else {
+    openProfileMenu();
+  }
+}
+
+function openProfileMenu() {
+  const existing = document.getElementById('profile-menu');
+  if (existing) existing.remove();
+  App.profileMenuOpen = true;
+
+  const isSuperAdmin = App.user && App.user.role === 'Super Admin';
+  const isAdmin      = App.user && (App.user.role === 'Admin' || isSuperAdmin);
+
+  const menu = document.createElement('div');
+  menu.id = 'profile-menu';
+  menu.className = 'profile-menu';
+  menu.innerHTML =
+    '<div class="profile-menu__header">' +
+      '<div class="profile-menu__name">' + escHtml(App.user ? App.user.name : '') + '</div>' +
+      '<div class="profile-menu__role">' + escHtml(App.user ? App.user.role : '') +
+        ' · ' + escHtml(App.user ? App.user.staffId : '') + '</div>' +
+    '</div>' +
+    '<button class="profile-menu__item" onclick="goChangePassword()">🔑 Change Password</button>' +
+    (isAdmin ? '<button class="profile-menu__item" onclick="renderView(\'adminHome\')">🏠 Admin Home</button>' : '') +
+    '<button class="profile-menu__item profile-menu__item--danger" onclick="logout()">🚪 Log Out</button>';
+
+  document.querySelector('.app-bar') && document.querySelector('.app-bar').appendChild(menu);
+
+  // Close on outside click
+  setTimeout(function () {
+    document.addEventListener('click', function outsideClick(e) {
+      if (!menu.contains(e.target)) {
+        closeProfileMenu();
+        document.removeEventListener('click', outsideClick);
+      }
+    });
+  }, 0);
+}
+
+function closeProfileMenu() {
+  const menu = document.getElementById('profile-menu');
+  if (menu) menu.remove();
+  App.profileMenuOpen = false;
+}
+
+function goChangePassword() {
+  closeProfileMenu();
+  renderView('changePassword');
+}
+
+// ─── APP BAR TEMPLATE ─────────────────────────────────────────────────────────
+
+function appBarHtml(title, subtitle, showBack, backView) {
+  const user = App.user;
+  const avatarInitials = user ? initials(user.name) : '?';
+  return (
+    '<div class="app-bar">' +
+      (showBack
+        ? '<button class="app-bar__back" onclick="renderView(\'' + backView + '\')" aria-label="Back">&#8592;</button>'
+        : '') +
+      '<div class="app-bar__title">' +
+        '<h1>' + escHtml(title) + '</h1>' +
+        (subtitle ? '<div class="subtitle">' + escHtml(subtitle) + '</div>' : '') +
+      '</div>' +
+      '<span class="session-badge">' + escHtml(sessionLabel()) + '</span>' +
+      '<button class="app-bar__avatar" onclick="toggleProfileMenu()" aria-label="Profile menu">' +
+        avatarInitials +
+      '</button>' +
+    '</div>'
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// VIEWS
+// Each view function returns an HTML string.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const Views = {};
+
+// ─── VIEW: LOGIN (Screen 1) ───────────────────────────────────────────────────
+
+Views.login = function () {
+  return (
+    '<div class="login-screen">' +
+      '<div class="login-logo">' +
+        '<span class="login-logo__icon">🎓</span>' +
+        '<h1>His Grace Universal Schools</h1>' +
+        '<p>Academic Result Management System</p>' +
+      '</div>' +
+      '<div class="login-card">' +
+        '<h2>Sign In</h2>' +
+        '<div id="login-alert"></div>' +
+        '<div class="form-group">' +
+          '<label class="form-label" for="login-username">Username</label>' +
+          '<input class="form-input" type="text" id="login-username" autocomplete="username" ' +
+            'autocapitalize="none" spellcheck="false" placeholder="Enter your username">' +
+          '<div class="form-hint error hidden" id="login-username-hint"></div>' +
+        '</div>' +
+        '<div class="form-group">' +
+          '<label class="form-label" for="login-password">Password</label>' +
+          '<div class="input-wrapper">' +
+            '<input class="form-input form-input--icon" type="password" id="login-password" ' +
+              'autocomplete="current-password" placeholder="Enter your password">' +
+            '<button class="input-icon-btn" onclick="togglePwVisibility(\'login-password\',this)" ' +
+              'type="button" aria-label="Show/hide password">👁</button>' +
+          '</div>' +
+          '<div class="form-hint error hidden" id="login-password-hint"></div>' +
+        '</div>' +
+        '<div id="login-error" class="mb-md"></div>' +
+        '<button class="btn btn--primary btn--full" id="login-btn" onclick="submitLogin()">' +
+          '<span class="btn-text">Sign In</span>' +
+          '<span class="spinner"></span>' +
+        '</button>' +
+        '<p class="text-center text-xs text-muted mt-md">Forgot your password? Contact your administrator.</p>' +
+      '</div>' +
+    '</div>'
+  );
+};
+
+function togglePwVisibility(inputId, btn) {
+  const input = document.getElementById(inputId);
+  if (!input) return;
+  if (input.type === 'password') {
+    input.type = 'text';
+    btn.textContent = '🙈';
+  } else {
+    input.type = 'password';
+    btn.textContent = '👁';
+  }
+}
+
+function submitLogin() {
+  const username = (document.getElementById('login-username').value || '').trim();
+  const password = document.getElementById('login-password').value || '';
+
+  clearAlert('login-error');
+
+  if (!username) {
+    showAlert('login-error', 'Please enter your username.', 'error');
+    return;
+  }
+  if (!password) {
+    showAlert('login-error', 'Please enter your password.', 'error');
+    return;
+  }
+
+  setButtonLoading('login-btn', true);
+
+  google.script.run
+    .withSuccessHandler(onLoginResult)
+    .withFailureHandler(function (err) {
+      setButtonLoading('login-btn', false);
+      showAlert('login-error', 'Connection error. Please try again.', 'error');
+    })
+    .serverLogin(username, password);
+}
+
+function onLoginResult(result) {
+  setButtonLoading('login-btn', false);
+  if (!result.success) {
+    showAlert('login-error', result.error, 'error');
+    return;
+  }
+  // Get session settings before routing
+  google.script.run
+    .withSuccessHandler(function (settingsResult) {
+      const settings = (settingsResult && settingsResult.success) ? settingsResult.data : {};
+      saveSession(result.token, result.user, settings);
+      if (result.forcePasswordChange) {
+        renderView('forceChangePassword');
+      } else {
+        routeToHome();
+        showToast('Welcome back, ' + (result.user.name.split(' ')[0]) + '!', 'success');
+      }
+    })
+    .withFailureHandler(function () {
+      saveSession(result.token, result.user, {});
+      if (result.forcePasswordChange) {
+        renderView('forceChangePassword');
+      } else {
+        routeToHome();
+      }
+    })
+    .serverGetSessionSettings(result.token);
+}
+
+// ─── VIEW: FORCE CHANGE PASSWORD (Screen 1A) ──────────────────────────────────
+
+Views.forceChangePassword = function () {
+  const isBootstrap = App.user && App.user.role === 'Super Admin';
+  const greeting = isBootstrap
+    ? 'Welcome, Super Admin! Set your password to continue.'
+    : 'Welcome! You must set a new password before continuing.';
+  return (
+    '<div class="login-screen">' +
+      '<div class="login-logo">' +
+        '<span class="login-logo__icon">🔐</span>' +
+        '<h1>Set Your Password</h1>' +
+      '</div>' +
+      '<div class="login-card">' +
+        '<div class="alert alert--info mb-md">' + escHtml(greeting) + '</div>' +
+        '<div class="form-group">' +
+          '<label class="form-label" for="fcp-new">New Password</label>' +
+          '<div class="input-wrapper">' +
+            '<input class="form-input form-input--icon" type="password" id="fcp-new" ' +
+              'autocomplete="new-password" placeholder="At least 8 characters">' +
+            '<button class="input-icon-btn" onclick="togglePwVisibility(\'fcp-new\',this)" ' +
+              'type="button" aria-label="Show/hide">👁</button>' +
+          '</div>' +
+          '<div class="form-hint" id="fcp-new-hint"></div>' +
+        '</div>' +
+        '<div class="form-group">' +
+          '<label class="form-label" for="fcp-confirm">Confirm Password</label>' +
+          '<div class="input-wrapper">' +
+            '<input class="form-input form-input--icon" type="password" id="fcp-confirm" ' +
+              'autocomplete="new-password" placeholder="Re-enter your password">' +
+            '<button class="input-icon-btn" onclick="togglePwVisibility(\'fcp-confirm\',this)" ' +
+              'type="button" aria-label="Show/hide">👁</button>' +
+          '</div>' +
+          '<div class="form-hint" id="fcp-confirm-hint"></div>' +
+        '</div>' +
+        '<div id="fcp-alert" class="mb-md"></div>' +
+        '<button class="btn btn--primary btn--full" id="fcp-btn" onclick="submitForceChange()">' +
+          '<span class="btn-text">Set Password &amp; Continue</span>' +
+          '<span class="spinner"></span>' +
+        '</button>' +
+      '</div>' +
+    '</div>'
+  );
+};
+
+function submitForceChange() {
+  const newPw  = document.getElementById('fcp-new').value || '';
+  const confPw = document.getElementById('fcp-confirm').value || '';
+  clearAlert('fcp-alert');
+  clearFieldError('fcp-new');
+  clearFieldError('fcp-confirm');
+
+  if (newPw.length < 8) {
+    showFieldError('fcp-new', 'Password must be at least 8 characters.');
+    return;
+  }
+  if (newPw !== confPw) {
+    showFieldError('fcp-confirm', 'Passwords do not match.');
+    return;
+  }
+
+  setButtonLoading('fcp-btn', true);
+  google.script.run
+    .withSuccessHandler(function (result) {
+      setButtonLoading('fcp-btn', false);
+      if (!result.success) {
+        showAlert('fcp-alert', result.error, 'error');
+        return;
+      }
+      App.user.forcePasswordChange = false;
+      routeToHome();
+      showToast('Password set successfully!', 'success');
+    })
+    .withFailureHandler(function () {
+      setButtonLoading('fcp-btn', false);
+      showAlert('fcp-alert', 'Connection error. Please try again.', 'error');
+    })
+    .serverForceChangePassword(App.token, newPw, confPw);
+}
+
+// ─── VIEW: ADMIN HOME (Screen 11) ─────────────────────────────────────────────
+
+Views.adminHome = function () {
+  const role   = App.user ? App.user.role : 'Admin';
+  const name   = App.user ? App.user.name.split(' ')[0] : '';
+  const isSA   = role === 'Super Admin';
+
+  const greeting = 'Good day, ' + name + '!';
+  const subtitle = role + ' Panel';
+
+  const tiles = [
+    { icon: '👥', label: 'User List',          sub: 'Manage staff accounts',  view: 'userList',        alwaysShow: true },
+    { icon: '🏫', label: 'Classes & Subjects', sub: 'Sync and manage',        view: 'classesSubjects', alwaysShow: true },
+    { icon: '📋', label: 'Manage Assignments', sub: 'Form Masters & Teachers', view: 'assignments',     alwaysShow: true },
+    { icon: '⚙️', label: 'Session Settings',  sub: 'Active term, sync data', view: 'sessionSettings', alwaysShow: true },
+    { icon: '📊', label: 'Results Overview',   sub: 'All classes progress',   view: 'resultsOverview', alwaysShow: true },
+    { icon: '🗄️', label: 'Archive Session',   sub: 'End-of-year backup',     view: 'archive',         alwaysShow: true }
+  ];
+
+  const tilesHtml = tiles
+    .filter(t => t.alwaysShow || isSA)
+    .map(t => {
+      const isStage2 = ['classesSubjects','assignments','sessionSettings','resultsOverview','archive'].includes(t.view);
+      const onclick = isStage2
+        ? 'onclick="showToast(\'Coming in Stage 2!\',\'default\')"'
+        : 'onclick="renderView(\'' + t.view + '\')"';
+      return (
+        '<button class="nav-tile" ' + onclick + '>' +
+          '<span class="nav-tile__icon">' + t.icon + '</span>' +
+          '<span class="nav-tile__label">' + escHtml(t.label) + '</span>' +
+          '<span class="nav-tile__sub">' + escHtml(t.sub) + '</span>' +
+        '</button>'
+      );
+    }).join('');
+
+  return (
+    appBarHtml(greeting, subtitle, false) +
+    '<div class="section-header mt-sm">' + escHtml(sessionLabel()) + '</div>' +
+    '<div class="nav-tiles">' + tilesHtml + '</div>'
+  );
+};
+
+// ─── VIEW: TEACHER HOME — PLACEHOLDER (Screen 2 / Stage 2) ───────────────────
+
+Views.teacherHome = function () {
+  const name = App.user ? App.user.name.split(' ')[0] : '';
+  return (
+    appBarHtml('Good day, ' + name + '!', 'Teacher', false) +
+    '<div class="page-content">' +
+      '<div class="empty-state mt-lg">' +
+        '<div class="empty-state__icon">📚</div>' +
+        '<h3>Score Entry</h3>' +
+        '<p>Your assignment list and score entry screens will be available in Stage 2.</p>' +
+      '</div>' +
+    '</div>'
+  );
+};
+
+// ─── VIEW: USER LIST (Screen 14) ──────────────────────────────────────────────
+
+Views.userList = function () {
+  return (
+    appBarHtml('User List', 'Staff accounts', true, 'adminHome') +
+    '<div class="search-bar">' +
+      '<input type="text" id="user-search" placeholder="Search by name or username…" ' +
+        'oninput="filterUsers()">' +
+    '</div>' +
+    '<div id="user-list-body">' +
+      '<div class="empty-state mt-lg">' +
+        '<div class="spinner spinner--blue" style="width:32px;height:32px;border-width:4px;margin:0 auto"></div>' +
+        '<p class="mt-md text-muted">Loading users…</p>' +
+      '</div>' +
+    '</div>' +
+    '<button class="fab" onclick="renderView(\'addUser\')" aria-label="Add user" title="Add User">+</button>'
+  );
+};
+
+let _userListData = [];
+
+function initUserList() {
+  google.script.run
+    .withSuccessHandler(function (result) {
+      try {
+        var body = document.getElementById('user-list-body');
+        if (!body) return; // view was navigated away from
+
+        if (!result || !result.success) {
+          body.innerHTML =
+            '<div class="page-content"><div class="alert alert--error">' +
+            escHtml((result && result.error) || 'Could not load users. Please go back and try again.') +
+            '</div></div>';
+          return;
+        }
+        _userListData = result.data || [];
+        renderUserList(_userListData);
+      } catch (e) {
+        var body = document.getElementById('user-list-body');
+        if (body) body.innerHTML =
+          '<div class="page-content"><div class="alert alert--error">Display error: ' +
+          escHtml(e.message) + '</div></div>';
+      }
+    })
+    .withFailureHandler(function (err) {
+      var body = document.getElementById('user-list-body');
+      if (!body) return;
+      body.innerHTML =
+        '<div class="page-content"><div class="alert alert--error">' +
+        'Failed to load users: ' + escHtml((err && err.message) || 'Server error. Please try again.') +
+        '</div></div>';
+    })
+    .serverGetUserList(App.token);
+}
+
+function renderUserList(users) {
+  const body = document.getElementById('user-list-body');
+  if (!body) return;
+
+  if (!users || users.length === 0) {
+    body.innerHTML =
+      '<div class="page-content">' +
+        '<div class="empty-state mt-lg">' +
+          '<div class="empty-state__icon">👤</div>' +
+          '<h3>No Users Found</h3>' +
+          '<p>Tap the + button to add the first staff account.</p>' +
+        '</div>' +
+      '</div>';
+    return;
+  }
+
+  const isSA = App.user && App.user.role === 'Super Admin';
+
+  // Group by role
+  const groups = [
+    { label: 'Super Admin',  users: users.filter(u => u.role === 'Super Admin')  },
+    { label: 'Admin',        users: users.filter(u => u.role === 'Admin')         },
+    { label: 'Teachers',     users: users.filter(u => u.role === 'Teacher')       }
+  ].filter(g => g.users.length > 0);
+
+  let html = '';
+  groups.forEach(function (group) {
+    html += '<div class="section-header">' + escHtml(group.label) +
+      ' (' + group.users.length + ')</div>';
+    html += '<div class="card" style="margin:0;border-radius:0">';
+    group.users.forEach(function (user) {
+      const statusCls = user.employmentStatus === 'Resigned' ? ' style="opacity:.55"' : '';
+      html +=
+        '<div class="list-row" onclick="openUserProfile(\'' + escHtml(user.staffId) + '\')"' +
+          statusCls + '>' +
+          '<div class="list-row__avatar">' + escHtml(initials(user.name)) + '</div>' +
+          '<div class="list-row__info">' +
+            '<div class="list-row__name">' + escHtml(user.name) + '</div>' +
+            '<div class="list-row__sub">' +
+              escHtml(user.username) + ' · ' + escHtml(user.staffId) +
+              (user.employmentStatus !== 'Active' ? ' · ' + escHtml(user.employmentStatus) : '') +
+            '</div>' +
+          '</div>' +
+          roleBadge(user.role) +
+          '<span class="list-row__chevron">›</span>' +
+        '</div>';
+    });
+    html += '</div>';
+  });
+
+  body.innerHTML = html;
+}
+
+function filterUsers() {
+  const query = (document.getElementById('user-search').value || '').toLowerCase();
+  if (!query) {
+    renderUserList(_userListData);
+    return;
+  }
+  const filtered = _userListData.filter(u =>
+    (u.name || '').toLowerCase().includes(query) ||
+    (u.username || '').toLowerCase().includes(query) ||
+    (u.staffId || '').toLowerCase().includes(query) ||
+    (u.subjectSpecialty || '').toLowerCase().includes(query)
+  );
+  renderUserList(filtered);
+}
+
+function openUserProfile(staffId) {
+  renderView('editUser', { staffId: staffId });
+}
+
+// ─── VIEW: ADD USER (Screen 15) ───────────────────────────────────────────────
+
+Views.addUser = function () {
+  const isSA = App.user && App.user.role === 'Super Admin';
+  return (
+    appBarHtml('Add User', 'New staff account', true, 'userList') +
+    '<div class="page-content">' +
+      '<div class="card card--pad">' +
+        '<div id="adduser-alert" class="mb-md"></div>' +
+
+        '<div class="form-group">' +
+          '<label class="form-label" for="au-name">Full Name *</label>' +
+          '<input class="form-input" type="text" id="au-name" autocomplete="off" placeholder="e.g. Chukwuemeka Obi">' +
+          '<div class="form-hint error hidden" id="au-name-hint"></div>' +
+        '</div>' +
+
+        '<div class="form-group">' +
+          '<label class="form-label" for="au-username">Username *</label>' +
+          '<input class="form-input" type="text" id="au-username" autocomplete="off" ' +
+            'autocapitalize="none" placeholder="e.g. cobi_teacher">' +
+          '<div class="form-hint" id="au-username-hint">3–20 characters: letters, numbers, underscores.</div>' +
+        '</div>' +
+
+        '<div class="form-group">' +
+          '<label class="form-label" for="au-password">Temporary Password *</label>' +
+          '<div class="input-wrapper">' +
+            '<input class="form-input form-input--icon" type="text" id="au-password" ' +
+              'autocomplete="off" placeholder="At least 8 characters (visible for sharing)">' +
+            '<button class="input-icon-btn" onclick="togglePwVisibility(\'au-password\',this)" ' +
+              'type="button">👁</button>' +
+          '</div>' +
+          '<div class="form-hint" id="au-password-hint">Write this down — share it with the new staff member.</div>' +
+        '</div>' +
+
+        '<div class="form-group">' +
+          '<label class="form-label" for="au-email">Email</label>' +
+          '<input class="form-input" type="email" id="au-email" autocomplete="off" placeholder="Optional">' +
+        '</div>' +
+
+        '<div class="form-group">' +
+          '<label class="form-label" for="au-phone">Phone Number</label>' +
+          '<input class="form-input" type="tel" id="au-phone" placeholder="Optional">' +
+        '</div>' +
+
+        '<div class="form-group">' +
+          '<label class="form-label" for="au-specialty">Subject Specialty</label>' +
+          '<input class="form-input" type="text" id="au-specialty" placeholder="e.g. Mathematics, Physics">' +
+        '</div>' +
+
+        '<div class="form-group">' +
+          '<label class="form-label" for="au-status">Employment Status</label>' +
+          '<select class="form-select" id="au-status">' +
+            '<option value="Active">Active</option>' +
+            '<option value="On Leave">On Leave</option>' +
+          '</select>' +
+        '</div>' +
+
+        (isSA
+          ? '<div class="form-group">' +
+              '<label class="form-label" for="au-role">Role</label>' +
+              '<select class="form-select" id="au-role">' +
+                '<option value="Teacher">Teacher</option>' +
+                '<option value="Admin">Admin</option>' +
+              '</select>' +
+            '</div>'
+          : '') +
+
+        '<button class="btn btn--primary btn--full mt-md" id="au-btn" onclick="submitAddUser()">' +
+          '<span class="btn-text">Create Account</span>' +
+          '<span class="spinner"></span>' +
+        '</button>' +
+      '</div>' +
+    '</div>'
+  );
+};
+
+function initAddUser() {
+  // Live username check
+  const usernameInput = document.getElementById('au-username');
+  if (!usernameInput) return;
+  usernameInput.addEventListener('input', function () {
+    clearTimeout(App.usernameCheckTimer);
+    const val = this.value.trim();
+    if (!val) {
+      document.getElementById('au-username-hint').textContent = '3–20 characters: letters, numbers, underscores.';
+      document.getElementById('au-username-hint').className = 'form-hint';
+      clearFieldError('au-username');
+      return;
+    }
+    App.usernameCheckTimer = setTimeout(function () {
+      google.script.run
+        .withSuccessHandler(function (result) {
+          const hint = document.getElementById('au-username-hint');
+          if (!hint) return;
+          if (result.available) {
+            hint.textContent = '✓ Username is available.';
+            hint.className = 'form-hint success';
+            clearFieldError('au-username');
+          } else {
+            hint.textContent = result.reason || 'Not available.';
+            hint.className = 'form-hint error';
+          }
+        })
+        .serverCheckUsername(val);
+    }, 400);
+  });
+}
+
+function submitAddUser() {
+  clearAlert('adduser-alert');
+  clearFieldError('au-name');
+  clearFieldError('au-username');
+  clearFieldError('au-password');
+
+  const name      = (document.getElementById('au-name').value || '').trim();
+  const username  = (document.getElementById('au-username').value || '').trim();
+  const password  = (document.getElementById('au-password').value || '');
+  const email     = (document.getElementById('au-email')   ? document.getElementById('au-email').value   : '').trim();
+  const phone     = (document.getElementById('au-phone')   ? document.getElementById('au-phone').value   : '').trim();
+  const specialty = (document.getElementById('au-specialty')? document.getElementById('au-specialty').value: '').trim();
+  const status    = document.getElementById('au-status') ? document.getElementById('au-status').value : 'Active';
+  const roleEl    = document.getElementById('au-role');
+  const role      = roleEl ? roleEl.value : 'Teacher';
+
+  let valid = true;
+  if (!name)         { showFieldError('au-name', 'Full name is required.');           valid = false; }
+  if (!username)     { showFieldError('au-username', 'Username is required.');         valid = false; }
+  if (!password)     { showFieldError('au-password', 'Temporary password is required.'); valid = false; }
+  if (password && password.length < 8) { showFieldError('au-password', 'Password must be at least 8 characters.'); valid = false; }
+  if (!valid) return;
+
+  setButtonLoading('au-btn', true);
+
+  const userData = { name, username, password, email, phoneNumber: phone,
+                     subjectSpecialty: specialty, employmentStatus: status, role };
+
+  google.script.run
+    .withSuccessHandler(function (result) {
+      setButtonLoading('au-btn', false);
+      if (!result.success) {
+        showAlert('adduser-alert', result.error, 'error');
+        if (result.code === 'USERNAME_TAKEN') showFieldError('au-username', result.error);
+        return;
+      }
+      showToast(result.data.message, 'success');
+      renderView('userList');
+    })
+    .withFailureHandler(function () {
+      setButtonLoading('au-btn', false);
+      showAlert('adduser-alert', 'Connection error. Please try again.', 'error');
+    })
+    .serverAddUser(App.token, userData);
+}
+
+// ─── VIEW: EDIT USER / USER PROFILE (Screen 16) ───────────────────────────────
+
+Views.editUser = function (params) {
+  // Initial skeleton — data loaded in initEditUser
+  return (
+    appBarHtml('User Profile', 'Loading…', true, 'userList') +
+    '<div class="page-content">' +
+      '<div id="edituser-body">' +
+        '<div class="empty-state mt-lg">' +
+          '<div class="spinner spinner--blue" style="width:32px;height:32px;border-width:4px;margin:0 auto"></div>' +
+        '</div>' +
+      '</div>' +
+    '</div>'
+  );
+};
+
+function initEditUser(params) {
+  const staffId = params && params.staffId;
+  if (!staffId) {
+    document.getElementById('edituser-body').innerHTML =
+      '<div class="alert alert--error">No user selected.</div>';
+    return;
+  }
+
+  google.script.run
+    .withSuccessHandler(function (result) {
+      if (!result.success) {
+        document.getElementById('edituser-body').innerHTML =
+          '<div class="alert alert--error">' + escHtml(result.error) + '</div>';
+        return;
+      }
+      renderEditUserForm(result.data);
+    })
+    .withFailureHandler(function () {
+      document.getElementById('edituser-body').innerHTML =
+        '<div class="alert alert--error">Failed to load user.</div>';
+    })
+    .serverGetUser(App.token, staffId);
+}
+
+function renderEditUserForm(user) {
+  const body = document.getElementById('edituser-body');
+  if (!body) return;
+
+  // Update app bar title
+  const h1 = document.querySelector('.app-bar h1');
+  if (h1) h1.textContent = user.name;
+
+  const isSA        = App.user && App.user.role === 'Super Admin';
+  const isTargetSA  = user.role === 'Super Admin';
+  const isSelf      = App.user && App.user.staffId === user.staffId;
+  const canEditRole = isSA && !isSelf && !isTargetSA;
+
+  const statusOptions = ['Active', 'On Leave', 'Resigned'].map(s =>
+    '<option value="' + s + '"' + (user.employmentStatus === s ? ' selected' : '') + '>' + s + '</option>'
+  ).join('');
+
+  body.innerHTML =
+    '<div id="edituser-alert" class="mb-md"></div>' +
+
+    // Read-only info section
+    '<div class="card card--pad mb-md">' +
+      '<div class="d-flex align-center justify-between mb-sm">' +
+        '<div>' +
+          '<div class="fw-bold">' + escHtml(user.name) + '</div>' +
+          '<div class="text-xs text-muted">' + escHtml(user.staffId) + ' · ' + escHtml(user.username) + '</div>' +
+        '</div>' +
+        roleBadge(user.role) +
+      '</div>' +
+      '<div class="text-xs text-muted">' +
+        'Added by: ' + escHtml(user.addedBy || '—') + ' · ' +
+        'Joined: ' + escHtml(user.dateJoined || '—') +
+      '</div>' +
+    '</div>' +
+
+    // Editable fields
+    '<div class="card card--pad">' +
+      '<div class="form-group">' +
+        '<label class="form-label">Full Name</label>' +
+        '<input class="form-input" type="text" id="eu-name" value="' + escHtml(user.name) + '">' +
+      '</div>' +
+      '<div class="form-group">' +
+        '<label class="form-label">Email</label>' +
+        '<input class="form-input" type="email" id="eu-email" value="' + escHtml(user.email || '') + '">' +
+      '</div>' +
+      '<div class="form-group">' +
+        '<label class="form-label">Phone Number</label>' +
+        '<input class="form-input" type="tel" id="eu-phone" value="' + escHtml(user.phoneNumber || '') + '">' +
+      '</div>' +
+      '<div class="form-group">' +
+        '<label class="form-label">Subject Specialty</label>' +
+        '<input class="form-input" type="text" id="eu-specialty" value="' + escHtml(user.subjectSpecialty || '') + '">' +
+      '</div>' +
+      '<div class="form-group">' +
+        '<label class="form-label">Employment Status</label>' +
+        '<select class="form-select" id="eu-status">' + statusOptions + '</select>' +
+      '</div>' +
+
+      '<button class="btn btn--primary btn--full mt-md" id="eu-save-btn" onclick="submitEditUser(\'' + escHtml(user.staffId) + '\')">' +
+        '<span class="btn-text">Save Changes</span>' +
+        '<span class="spinner"></span>' +
+      '</button>' +
+    '</div>' +
+
+    // Reset password section
+    '<div class="card card--pad mt-md">' +
+      '<div class="fw-bold mb-sm">Reset Password</div>' +
+      '<p class="text-sm text-muted mb-md">Set a new temporary password for this user. They will be forced to change it on next login.</p>' +
+      '<div class="form-group">' +
+        '<label class="form-label">New Temporary Password</label>' +
+        '<input class="form-input" type="text" id="eu-new-temp-pw" placeholder="At least 8 characters">' +
+        '<div class="form-hint" id="eu-new-temp-pw-hint">Visible — share directly with the staff member.</div>' +
+      '</div>' +
+      '<button class="btn btn--secondary btn--full" id="eu-reset-pw-btn" onclick="submitResetPassword(\'' + escHtml(user.staffId) + '\')">' +
+        '<span class="btn-text">Reset Password</span>' +
+        '<span class="spinner"></span>' +
+      '</button>' +
+    '</div>' +
+
+    // Role assignment (Super Admin only, not for themselves or other SA)
+    (canEditRole
+      ? '<div class="card card--pad mt-md">' +
+          '<div class="fw-bold mb-sm">Change Role</div>' +
+          '<div class="d-flex gap-sm">' +
+            (user.role !== 'Admin'
+              ? '<button class="btn btn--secondary" onclick="submitChangeRole(\'' + escHtml(user.staffId) + '\', \'Admin\')">Promote to Admin</button>'
+              : '<button class="btn btn--secondary" onclick="submitChangeRole(\'' + escHtml(user.staffId) + '\', \'Teacher\')">Demote to Teacher</button>') +
+          '</div>' +
+        '</div>'
+      : '');
+}
+
+function submitEditUser(staffId) {
+  clearAlert('edituser-alert');
+  const updates = {
+    name:             (document.getElementById('eu-name')      ? document.getElementById('eu-name').value.trim()      : ''),
+    email:            (document.getElementById('eu-email')     ? document.getElementById('eu-email').value.trim()     : ''),
+    phoneNumber:      (document.getElementById('eu-phone')     ? document.getElementById('eu-phone').value.trim()     : ''),
+    subjectSpecialty: (document.getElementById('eu-specialty') ? document.getElementById('eu-specialty').value.trim() : ''),
+    employmentStatus: (document.getElementById('eu-status')    ? document.getElementById('eu-status').value           : '')
+  };
+
+  if (!updates.name) {
+    showAlert('edituser-alert', 'Full name is required.', 'error');
+    return;
+  }
+
+  setButtonLoading('eu-save-btn', true);
+  google.script.run
+    .withSuccessHandler(function (result) {
+      setButtonLoading('eu-save-btn', false);
+      if (!result.success) {
+        showAlert('edituser-alert', result.error, 'error');
+        return;
+      }
+      showToast('User updated.', 'success');
+      renderView('userList');
+    })
+    .withFailureHandler(function () {
+      setButtonLoading('eu-save-btn', false);
+      showAlert('edituser-alert', 'Connection error.', 'error');
+    })
+    .serverUpdateUser(App.token, staffId, updates);
+}
+
+function submitResetPassword(staffId) {
+  const newPw = document.getElementById('eu-new-temp-pw') ?
+    document.getElementById('eu-new-temp-pw').value : '';
+  if (!newPw || newPw.length < 8) {
+    showFieldError('eu-new-temp-pw', 'Temporary password must be at least 8 characters.');
+    return;
+  }
+  clearFieldError('eu-new-temp-pw');
+  setButtonLoading('eu-reset-pw-btn', true);
+
+  google.script.run
+    .withSuccessHandler(function (result) {
+      setButtonLoading('eu-reset-pw-btn', false);
+      if (!result.success) {
+        showAlert('edituser-alert', result.error, 'error');
+        return;
+      }
+      document.getElementById('eu-new-temp-pw').value = '';
+      showToast('Password reset. User will be prompted to change it.', 'success');
+    })
+    .withFailureHandler(function () {
+      setButtonLoading('eu-reset-pw-btn', false);
+      showAlert('edituser-alert', 'Connection error.', 'error');
+    })
+    .serverResetPassword(App.token, staffId, newPw);
+}
+
+function submitChangeRole(staffId, newRole) {
+  if (!confirm('Change this user\'s role to "' + newRole + '"?')) return;
+  google.script.run
+    .withSuccessHandler(function (result) {
+      if (!result.success) {
+        showToast(result.error, 'error');
+        return;
+      }
+      showToast(result.data.message, 'success');
+      renderView('userList');
+    })
+    .withFailureHandler(function () {
+      showToast('Connection error.', 'error');
+    })
+    .serverChangeRole(App.token, staffId, newRole);
+}
+
+// ─── VIEW: VOLUNTARY CHANGE PASSWORD (Screen 17) ─────────────────────────────
+
+Views.changePassword = function () {
+  const back = (App.user && (App.user.role === 'Super Admin' || App.user.role === 'Admin'))
+    ? 'adminHome' : 'teacherHome';
+  return (
+    appBarHtml('Change Password', 'Update your password', true, back) +
+    '<div class="page-content">' +
+      '<div class="card card--pad">' +
+        '<div id="cp-alert" class="mb-md"></div>' +
+
+        '<div class="form-group">' +
+          '<label class="form-label" for="cp-current">Current Password</label>' +
+          '<div class="input-wrapper">' +
+            '<input class="form-input form-input--icon" type="password" id="cp-current" ' +
+              'autocomplete="current-password" placeholder="Your current password">' +
+            '<button class="input-icon-btn" onclick="togglePwVisibility(\'cp-current\',this)" type="button">👁</button>' +
+          '</div>' +
+          '<div class="form-hint error hidden" id="cp-current-hint"></div>' +
+        '</div>' +
+
+        '<div class="form-group">' +
+          '<label class="form-label" for="cp-new">New Password</label>' +
+          '<div class="input-wrapper">' +
+            '<input class="form-input form-input--icon" type="password" id="cp-new" ' +
+              'autocomplete="new-password" placeholder="At least 8 characters">' +
+            '<button class="input-icon-btn" onclick="togglePwVisibility(\'cp-new\',this)" type="button">👁</button>' +
+          '</div>' +
+          '<div class="form-hint error hidden" id="cp-new-hint"></div>' +
+        '</div>' +
+
+        '<div class="form-group">' +
+          '<label class="form-label" for="cp-confirm">Confirm New Password</label>' +
+          '<div class="input-wrapper">' +
+            '<input class="form-input form-input--icon" type="password" id="cp-confirm" ' +
+              'autocomplete="new-password" placeholder="Re-enter your new password">' +
+            '<button class="input-icon-btn" onclick="togglePwVisibility(\'cp-confirm\',this)" type="button">👁</button>' +
+          '</div>' +
+          '<div class="form-hint error hidden" id="cp-confirm-hint"></div>' +
+        '</div>' +
+
+        '<button class="btn btn--primary btn--full mt-md" id="cp-btn" onclick="submitChangePassword()">' +
+          '<span class="btn-text">Update Password</span>' +
+          '<span class="spinner"></span>' +
+        '</button>' +
+      '</div>' +
+    '</div>'
+  );
+};
+
+function submitChangePassword() {
+  clearAlert('cp-alert');
+  clearFieldError('cp-current');
+  clearFieldError('cp-new');
+  clearFieldError('cp-confirm');
+
+  const current = document.getElementById('cp-current').value || '';
+  const newPw   = document.getElementById('cp-new').value     || '';
+  const confirm = document.getElementById('cp-confirm').value || '';
+
+  let valid = true;
+  if (!current)               { showFieldError('cp-current', 'Current password is required.'); valid = false; }
+  if (newPw.length < 8)       { showFieldError('cp-new', 'Password must be at least 8 characters.'); valid = false; }
+  if (newPw !== confirm)      { showFieldError('cp-confirm', 'Passwords do not match.'); valid = false; }
+  if (!valid) return;
+
+  setButtonLoading('cp-btn', true);
+  google.script.run
+    .withSuccessHandler(function (result) {
+      setButtonLoading('cp-btn', false);
+      if (!result.success) {
+        if (result.code === 'WRONG_PASSWORD') {
+          showFieldError('cp-current', 'Current password is incorrect.');
+        } else {
+          showAlert('cp-alert', result.error, 'error');
+        }
+        return;
+      }
+      showToast('Password changed successfully.', 'success');
+      const back = (App.user && (App.user.role === 'Super Admin' || App.user.role === 'Admin'))
+        ? 'adminHome' : 'teacherHome';
+      renderView(back);
+    })
+    .withFailureHandler(function () {
+      setButtonLoading('cp-btn', false);
+      showAlert('cp-alert', 'Connection error. Please try again.', 'error');
+    })
+    .serverChangePassword(App.token, current, newPw, confirm);
+}
+</script>

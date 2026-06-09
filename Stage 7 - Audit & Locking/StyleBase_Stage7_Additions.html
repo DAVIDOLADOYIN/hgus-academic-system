@@ -1,0 +1,254 @@
+<!-- ═══════════════════════════════════════════════════════════════════════════
+     STAGE 7 — StyleBase additions
+     INSTRUCTIONS: Append everything below (starting at the comment above)
+     to the END of your existing StyleBase.html, just before the closing </style> tag.
+     ═══════════════════════════════════════════════════════════════════════════ -->
+
+/* ─── PSQ PROGRESS STRIP — STICKY OFFSET FIX ────────────────────────────────
+   Stage 6 used top:var(--bar-height) but view-body IS the scroll container,
+   so that offset caused the strip to hang 56px below the scroll-area top,
+   overlapping the first trait row before the user even scrolled.
+   Overriding to top:0 — the app bar is outside view-body, so 0 is correct. */
+
+.psq-progress { top: 0; }
+
+/* ─── RESULT LOCK BADGE ──────────────────────────────────────────────────────
+   Shown on locked class cards in the Classes & Subjects list.
+   Also used as an inline indicator inside the class-detail action row.     */
+
+.lock-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  background: #fff3e0;            /* amber tint — warning without alarm      */
+  border: 1px solid #ffcc80;
+  border-radius: var(--radius-full);
+  padding: 2px 8px;
+  font-size: var(--text-xs);
+  font-weight: 700;
+  color: #e65100;
+  white-space: nowrap;
+  user-select: none;
+}
+
+.lock-badge__icon {
+  font-size: 11px;
+  line-height: 1;
+}
+
+/* Compact variant used inside fm-action-btn rows */
+.lock-badge--sm {
+  padding: 1px 6px;
+  font-size: 11px;
+}
+
+/* ─── LOCK ACTION BUTTON ─────────────────────────────────────────────────────
+   Full-width lock/unlock action button shown in the class detail screen
+   for Admin / Super Admin users only.                                       */
+
+.lock-action-row {
+  margin: var(--space-md) var(--space-md) 0;
+}
+
+.btn--lock {
+  background: #fff3e0;
+  color: #e65100;
+  border: 1.5px solid #ffcc80;
+  font-weight: 700;
+}
+.btn--lock:hover { background: #ffe0b2; }
+
+.btn--unlock {
+  background: var(--color-success-bg);
+  color: var(--color-success);
+  border: 1.5px solid #a5d6a7;
+  font-weight: 700;
+}
+.btn--unlock:hover { background: #d9edd9; }
+
+/* ─── ACTIVITY LOG VIEW ───────────────────────────────────────────────────────
+   Full-screen activity log list with filter bar at the top.                */
+
+/* Filter row: category dropdown + date-from + date-to inputs + Apply button */
+.log-filter-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-sm);
+  padding: var(--space-md);
+  background: var(--color-surface);
+  border-bottom: 1px solid var(--color-border);
+  align-items: flex-end;
+}
+
+.log-filter-bar .form-group {
+  flex: 1 1 120px;
+  min-width: 100px;
+  margin-bottom: 0;
+}
+
+.log-filter-bar__apply {
+  flex-shrink: 0;
+  align-self: flex-end;
+}
+
+/* One log entry row */
+.log-entry {
+  padding: var(--space-sm) var(--space-md);
+  border-bottom: 1px solid var(--color-border);
+}
+.log-entry:last-child { border-bottom: none; }
+
+.log-entry__header {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  flex-wrap: wrap;
+  margin-bottom: 2px;
+}
+
+.log-entry__time {
+  font-size: var(--text-xs);
+  color: var(--color-text-sec);
+  white-space: nowrap;
+}
+
+.log-entry__category {
+  display: inline-block;
+  padding: 1px 7px;
+  border-radius: var(--radius-full);
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+  white-space: nowrap;
+}
+
+/* Category colour coding */
+.log-entry__category--auth        { background: #fce4ec; color: #c62828; }
+.log-entry__category--user        { background: #e8eaf6; color: #283593; }
+.log-entry__category--config      { background: #e3f2fd; color: #1565c0; }
+.log-entry__category--results     { background: #e8f5e9; color: #2e7d32; }
+.log-entry__category--corrections { background: #fff8e1; color: #f57f17; }
+.log-entry__category--lock        { background: #fff3e0; color: #e65100; }
+.log-entry__category--archive     { background: #f3e5f5; color: #6a1b9a; }
+.log-entry__category--default     { background: var(--grey-200); color: var(--color-text-sec); }
+
+.log-entry__action {
+  font-size: var(--text-sm);
+  font-weight: 600;
+  color: var(--color-text);
+}
+
+.log-entry__detail {
+  font-size: var(--text-sm);
+  color: var(--color-text-sec);
+  margin-top: 1px;
+}
+
+.log-entry__staff {
+  font-size: var(--text-xs);
+  color: var(--color-text-sec);
+}
+
+/* Shown when no entries match the filter */
+.log-empty {
+  padding: var(--space-xl);
+  text-align: center;
+  color: var(--color-text-sec);
+  font-size: var(--text-sm);
+}
+
+/* Total count strip above the list */
+.log-count-strip {
+  padding: var(--space-xs) var(--space-md);
+  font-size: var(--text-xs);
+  color: var(--color-text-sec);
+  border-bottom: 1px solid var(--color-border);
+  background: var(--grey-50);
+}
+
+/* ─── SUPER ADMIN SETTINGS CARD ───────────────────────────────────────────── */
+
+.sa-settings-card {
+  background: var(--color-surface);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-sm);
+  padding: var(--space-md);
+  margin: 0 var(--space-md) var(--space-md);
+}
+
+.sa-settings-card__title {
+  font-size: var(--text-xs);
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: .06em;
+  color: var(--color-text-sec);
+  margin-bottom: var(--space-sm);
+}
+
+/* Toggle row: label on left, toggle switch on right */
+.toggle-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-sm);
+  min-height: var(--tap-min);
+}
+
+.toggle-row__label {
+  font-size: var(--text-sm);
+  color: var(--color-text);
+  flex: 1;
+}
+
+.toggle-row__sub {
+  font-size: var(--text-xs);
+  color: var(--color-text-sec);
+  margin-top: 2px;
+}
+
+/* iOS-style toggle switch */
+.toggle-switch {
+  position: relative;
+  display: inline-block;
+  width: 44px;
+  height: 26px;
+  flex-shrink: 0;
+}
+
+.toggle-switch input {
+  opacity: 0;
+  width: 0;
+  height: 0;
+  position: absolute;
+}
+
+.toggle-switch__slider {
+  position: absolute;
+  inset: 0;
+  background: var(--grey-300);
+  border-radius: 26px;
+  cursor: pointer;
+  transition: background .2s;
+}
+
+.toggle-switch__slider::before {
+  content: '';
+  position: absolute;
+  height: 20px;
+  width: 20px;
+  left: 3px;
+  bottom: 3px;
+  background: white;
+  border-radius: 50%;
+  transition: transform .2s;
+  box-shadow: 0 1px 3px rgba(0,0,0,.2);
+}
+
+.toggle-switch input:checked + .toggle-switch__slider {
+  background: var(--color-primary);
+}
+
+.toggle-switch input:checked + .toggle-switch__slider::before {
+  transform: translateX(18px);
+}

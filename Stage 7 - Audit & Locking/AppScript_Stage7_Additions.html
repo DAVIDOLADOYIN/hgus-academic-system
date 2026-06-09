@@ -1,0 +1,620 @@
+<script>
+/* ═══════════════════════════════════════════════════════════════════════════
+   STAGE 7 — AppScript additions
+   INSTRUCTIONS: Append the entire contents of this file to the END of your
+   existing AppScript.html, just before the closing </script> tag.
+
+   What this adds:
+     1. Result-lock badge on class cards in Classes & Subjects screen
+     2. Lock / Unlock button on the class-detail action list (Admin only)
+     3. Activity Log view (Super Admin home tile + full filterable log screen)
+     4. Super Admin Settings card (adminCanViewLog toggle)
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// STAGE 7: RESULT LOCKING — class list badges + lock/unlock button
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Module-level cache: classId → boolean (true = locked).
+ * Populated once per Classes & Subjects load; read by class-detail rendering.
+ */
+var _lockMap = {};
+
+// ─── INJECT LOCK BADGES ON CLASSES & SUBJECTS SCREEN ─────────────────────────
+//
+// We hook into the `assignments` view init (which also loads classesSubjects
+// in the same app section) by extending initView here.
+//
+// More precisely: the class list is rendered inside the classesSubjects view.
+// After it loads we fetch lock states from the server and inject badges.
+
+(function () {
+  var _origInitView7 = initView; // capture Stage 6 reference
+
+  initView = function (view, params) {
+    _origInitView7(view, params);
+
+    // After the classesSubjects view loads, fetch lock states + inject badges
+    if (view === 'classesSubjects') {
+      fetchAndInjectLockBadges();
+    }
+
+    // After fmClassOverview loads (Admin navigating to a class), show lock status
+    if (view === 'fmClassOverview') {
+      initClassLockPanel(params);
+    }
+  };
+})();
+
+/**
+ * Fetch lock states for all classes and inject padlock badges next to
+ * class names in the rendered list.
+ *
+ * Uses polling (same pattern as broadsheet export bar injection) because
+ * the classesSubjects view loads data asynchronously.
+ */
+function fetchAndInjectLockBadges() {
+  // Only Admin / Super Admin see lock states
+  if (!App.user || App.user.role === 'Teacher') return;
+
+  google.script.run
+    .withSuccessHandler(function (result) {
+      if (handleSessionExpired(result)) return;
+      if (!result || !result.success) return;
+
+      _lockMap = result.data.lockMap || {};
+
+      // Poll until the class list renders (max 8 seconds)
+      var attempts    = 0;
+      var maxAttempts = 27;
+      var poll = setInterval(function () {
+        attempts++;
+        if (App.currentView !== 'classesSubjects') { clearInterval(poll); return; }
+
+        // The class list renders inside .fm-action-btn elements
+        var btns = document.querySelectorAll('.fm-action-btn[data-class-id]');
+        if (btns.length > 0) {
+          clearInterval(poll);
+          injectLockBadgesIntoList(btns);
+          return;
+        }
+        if (attempts >= maxAttempts) clearInterval(poll);
+      }, 300);
+    })
+    .withFailureHandler(function () { /* silent fail */ })
+    .serverGetClassLockStates(App.token);
+}
+
+/**
+ * Physically add a lock badge next to each locked class button.
+ *
+ * @param {NodeList} btns — all .fm-action-btn elements with data-class-id
+ */
+function injectLockBadgesIntoList(btns) {
+  btns.forEach(function (btn) {
+    var cid = btn.getAttribute('data-class-id');
+    if (!cid || !_lockMap[cid]) return; // not locked — no badge needed
+
+    // Avoid double-injection
+    if (btn.querySelector('.lock-badge')) return;
+
+    // Insert the badge before the arrow chevron
+    var arrow = btn.querySelector('.fm-action-btn__arrow');
+    var badge = document.createElement('span');
+    badge.className = 'lock-badge lock-badge--sm';
+    badge.innerHTML = '<span class="lock-badge__icon">🔒</span> Locked';
+    if (arrow) {
+      btn.insertBefore(badge, arrow);
+    } else {
+      btn.appendChild(badge);
+    }
+  });
+}
+
+// ─── CLASS DETAIL LOCK PANEL ──────────────────────────────────────────────────
+//
+// When Admin navigates to a class (fmClassOverview), we inject a Lock/Unlock
+// button at the top of the action list so Admin can toggle the lock without
+// leaving the class detail screen.
+
+/**
+ * Load lock status for the class and inject the lock action panel.
+ *
+ * @param {{ classId: string }} params
+ */
+function initClassLockPanel(params) {
+  var classId = params && params.classId;
+  if (!classId) return;
+
+  // Only show for Admin / Super Admin
+  if (!App.user || App.user.role === 'Teacher') return;
+
+  google.script.run
+    .withSuccessHandler(function (result) {
+      if (handleSessionExpired(result)) return;
+      if (!result || !result.success) return;
+
+      var locked    = result.data.isLocked;
+      var lockedBy  = result.data.lockedBy  || '';
+      var lockedAt  = result.data.lockedAt  || '';
+
+      // Poll until the class overview body is rendered
+      var attempts    = 0;
+      var maxAttempts = 27;
+      var poll = setInterval(function () {
+        attempts++;
+        if (App.currentView !== 'fmClassOverview') { clearInterval(poll); return; }
+
+        var body = document.getElementById('fmco-body') || document.querySelector('.view-body');
+        if (body && !body.querySelector('.loading-placeholder')) {
+          clearInterval(poll);
+          injectLockActionPanel(body, classId, locked, lockedBy, lockedAt);
+          return;
+        }
+        if (attempts >= maxAttempts) clearInterval(poll);
+      }, 300);
+    })
+    .withFailureHandler(function () { /* silent fail */ })
+    .serverGetClassTermLockStatus(App.token, classId);
+}
+
+/**
+ * Build and inject the lock action panel at the top of the class detail view.
+ *
+ * @param {HTMLElement} body
+ * @param {string}      classId
+ * @param {boolean}     locked
+ * @param {string}      lockedBy
+ * @param {string}      lockedAt
+ */
+function injectLockActionPanel(body, classId, locked, lockedBy, lockedAt) {
+  if (document.getElementById('class-lock-panel')) return; // already injected
+
+  var cidJs    = classId.replace(/'/g, "\\'");
+  var lockedHtml = '';
+
+  if (locked) {
+    var lockedWhen = lockedAt ? ' on ' + new Date(lockedAt).toLocaleDateString() : '';
+    lockedHtml =
+      '<div class="lock-badge" style="margin-bottom:8px;display:inline-flex;">' +
+        '<span class="lock-badge__icon">🔒</span>' +
+        ' Locked by ' + escHtml(lockedBy) + lockedWhen +
+      '</div>';
+  }
+
+  var panel = document.createElement('div');
+  panel.id        = 'class-lock-panel';
+  panel.className = 'section-card';
+  panel.style.cssText = 'margin:var(--space-md) var(--space-md) 0;';
+  panel.innerHTML =
+    '<div class="section-title">RESULT LOCK</div>' +
+    lockedHtml +
+    '<div id="class-lock-alert" class="mb-sm"></div>' +
+    (locked
+      ? '<button class="btn btn--full btn--unlock" id="class-lock-btn" ' +
+          'onclick="toggleClassLock(\'' + cidJs + '\', false, this)">' +
+          '<span class="btn-text">🔓 Unlock Class Results</span>' +
+          '<span class="spinner"></span>' +
+        '</button>'
+      : '<button class="btn btn--full btn--lock" id="class-lock-btn" ' +
+          'onclick="toggleClassLock(\'' + cidJs + '\', true, this)">' +
+          '<span class="btn-text">🔒 Lock Class Results</span>' +
+          '<span class="spinner"></span>' +
+        '</button>'
+    );
+
+  // Insert as the first child of the view body
+  body.insertBefore(panel, body.firstChild);
+}
+
+/**
+ * Lock or unlock a class-term.
+ *
+ * @param {string}      classId
+ * @param {boolean}     shouldLock   — true = lock, false = unlock
+ * @param {HTMLElement} btn
+ */
+function toggleClassLock(classId, shouldLock, btn) {
+  var alertEl = document.getElementById('class-lock-alert');
+  var action  = shouldLock ? 'lock' : 'unlock';
+
+  if (!confirm('Are you sure you want to ' + action + ' results for this class?\n' +
+               (shouldLock
+                 ? 'Teachers will not be able to save scores until unlocked.'
+                 : 'Teachers will be able to edit scores again.'))) return;
+
+  setButtonLoading('class-lock-btn', true);
+
+  var fn = shouldLock ? 'serverLockClassTerm' : 'serverUnlockClassTerm';
+
+  google.script.run
+    .withSuccessHandler(function (result) {
+      setButtonLoading('class-lock-btn', false);
+      if (handleSessionExpired(result)) return;
+      if (!result || !result.success) {
+        if (alertEl) {
+          alertEl.innerHTML =
+            '<div class="alert alert--error">' + escHtml(result.error || 'Failed.') + '</div>';
+        }
+        return;
+      }
+
+      // Re-initialise the class detail to reflect the new lock state
+      showToast(shouldLock ? 'Class locked.' : 'Class unlocked.', 'success');
+      // Remove and re-inject the panel with updated state
+      var panel = document.getElementById('class-lock-panel');
+      if (panel) panel.parentNode.removeChild(panel);
+      initClassLockPanel(App.viewParams);
+
+      // Also update the local _lockMap so the class list badge updates
+      // on the next classesSubjects render without a server round-trip
+      _lockMap[classId] = !!result.data.isLocked;
+    })
+    .withFailureHandler(function () {
+      setButtonLoading('class-lock-btn', false);
+      if (alertEl) {
+        alertEl.innerHTML =
+          '<div class="alert alert--error">Connection error. Please try again.</div>';
+      }
+    })
+    [fn](App.token, classId);
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// STAGE 7: ACTIVITY LOG VIEW
+// Super Admin only (Admins can view if SA has enabled it).
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Module-level filter state (persisted during the session)
+var _logFilters = { category: '', staffId: '', dateFrom: '', dateTo: '' };
+
+// ─── EXTEND renderView: add activityLog route ──────────────────────────────
+
+(function () {
+  var _origRenderView7 = renderView;
+
+  renderView = function (view, params) {
+    if (view === 'activityLog') {
+      App.currentView     = view;
+      App.viewParams      = params || {};
+      App.profileMenuOpen = false;
+      document.getElementById('app').innerHTML = Views.activityLog(App.viewParams);
+      initView(view, App.viewParams);
+      resetInactivityTimer();
+      return;
+    }
+    if (view === 'superAdminSettings') {
+      App.currentView     = view;
+      App.viewParams      = params || {};
+      App.profileMenuOpen = false;
+      document.getElementById('app').innerHTML = Views.superAdminSettings(App.viewParams);
+      initView(view, App.viewParams);
+      resetInactivityTimer();
+      return;
+    }
+    _origRenderView7(view, params);
+  };
+})();
+
+// ─── EXTEND initView: add activityLog + superAdminSettings inits ──────────────
+
+(function () {
+  var _origInitView7b = initView;
+
+  initView = function (view, params) {
+    _origInitView7b(view, params);
+
+    if (view === 'activityLog')      { initActivityLog(params);      }
+    if (view === 'superAdminSettings') { initSuperAdminSettings(params); }
+  };
+})();
+
+// ─── EXTEND adminHome: add Activity Log tile for Super Admin ──────────────────
+
+(function () {
+  var _origAdminHome7 = Views.adminHome;
+
+  Views.adminHome = function () {
+    var origHtml = _origAdminHome7();
+
+    // Only inject for Super Admin (or if SA has enabled it for Admin)
+    // We don't know at render time whether SA has enabled it — show the tile
+    // for Super Admin only; Admins will get an access error if not enabled.
+    if (!App.user || App.user.role === 'Teacher') return origHtml;
+
+    var tiles = '';
+
+    // Activity Log tile — Super Admin always; Admin conditionally (server enforces)
+    if (App.user.role === 'Super Admin') {
+      tiles +=
+        '<button class="nav-tile" onclick="renderView(\'activityLog\')">' +
+          '<span class="nav-tile__icon">📋</span>' +
+          '<span class="nav-tile__label">Activity Log</span>' +
+          '<span class="nav-tile__sub">Audit trail of all actions</span>' +
+        '</button>';
+
+      tiles +=
+        '<button class="nav-tile" onclick="renderView(\'superAdminSettings\')">' +
+          '<span class="nav-tile__icon">⚙️</span>' +
+          '<span class="nav-tile__label">SA Settings</span>' +
+          '<span class="nav-tile__sub">Super Admin preferences</span>' +
+        '</button>';
+    }
+
+    if (!tiles) return origHtml;
+
+    var lastDiv = origHtml.lastIndexOf('</div>');
+    if (lastDiv !== -1) {
+      return origHtml.substring(0, lastDiv) + tiles + origHtml.substring(lastDiv);
+    }
+    return origHtml + tiles;
+  };
+})();
+
+// ─── ACTIVITY LOG VIEW RENDERER ───────────────────────────────────────────────
+
+Views.activityLog = function () {
+  return (
+    appBarHtml('Activity Log', 'Audit trail of all events', true, 'adminHome') +
+    '<div class="view-body" id="log-view-body">' +
+      // Filter bar
+      '<div class="log-filter-bar" id="log-filter-bar">' +
+        '<div class="form-group">' +
+          '<label class="form-label">Category</label>' +
+          '<select class="form-select" id="log-filter-category">' +
+            '<option value="">All Categories</option>' +
+            '<option value="Auth">Auth</option>' +
+            '<option value="User Management">User Management</option>' +
+            '<option value="Configuration">Configuration</option>' +
+            '<option value="Results">Results</option>' +
+            '<option value="Corrections">Corrections</option>' +
+            '<option value="Lock">Lock</option>' +
+          '</select>' +
+        '</div>' +
+        '<div class="form-group">' +
+          '<label class="form-label">Date From</label>' +
+          '<input class="form-input" type="date" id="log-filter-from">' +
+        '</div>' +
+        '<div class="form-group">' +
+          '<label class="form-label">Date To</label>' +
+          '<input class="form-input" type="date" id="log-filter-to">' +
+        '</div>' +
+        '<button class="btn btn--primary log-filter-bar__apply" id="log-apply-btn" ' +
+          'onclick="applyLogFilters()">' +
+          '<span class="btn-text">Apply</span>' +
+          '<span class="spinner"></span>' +
+        '</button>' +
+      '</div>' +
+      '<div id="log-list-area">' +
+        '<div class="loading-placeholder">Loading activity log&hellip;</div>' +
+      '</div>' +
+    '</div>'
+  );
+};
+
+// ─── ACTIVITY LOG INIT ────────────────────────────────────────────────────────
+
+function initActivityLog() {
+  // Restore previously selected filters if the user navigated back here
+  var catEl  = document.getElementById('log-filter-category');
+  var fromEl = document.getElementById('log-filter-from');
+  var toEl   = document.getElementById('log-filter-to');
+  if (catEl)  catEl.value  = _logFilters.category  || '';
+  if (fromEl) fromEl.value = _logFilters.dateFrom   || '';
+  if (toEl)   toEl.value   = _logFilters.dateTo     || '';
+
+  loadActivityLog(_logFilters);
+}
+
+/**
+ * Read the filter inputs, persist them to _logFilters, and reload the log.
+ */
+function applyLogFilters() {
+  _logFilters.category = (document.getElementById('log-filter-category') || {}).value || '';
+  _logFilters.dateFrom = (document.getElementById('log-filter-from')     || {}).value || '';
+  _logFilters.dateTo   = (document.getElementById('log-filter-to')       || {}).value || '';
+  setButtonLoading('log-apply-btn', true);
+  loadActivityLog(_logFilters);
+}
+
+/**
+ * Fetch log entries from the server and render the list.
+ *
+ * @param {Object} filters
+ */
+function loadActivityLog(filters) {
+  google.script.run
+    .withSuccessHandler(function (result) {
+      setButtonLoading('log-apply-btn', false);
+      if (handleSessionExpired(result)) return;
+      var area = document.getElementById('log-list-area');
+      if (!area) return;
+
+      if (!result || !result.success) {
+        area.innerHTML =
+          '<div class="alert alert--error" style="margin:var(--space-md)">' +
+          escHtml((result && result.error) || 'Could not load activity log.') + '</div>';
+        return;
+      }
+
+      renderActivityLogList(result.data, area);
+    })
+    .withFailureHandler(function (err) {
+      setButtonLoading('log-apply-btn', false);
+      var area = document.getElementById('log-list-area');
+      if (area) {
+        area.innerHTML =
+          '<div class="alert alert--error" style="margin:var(--space-md)">Connection error.</div>';
+      }
+    })
+    .serverGetActivityLog(App.token, filters || {}, 200);
+}
+
+/**
+ * Render the log entries into the list area.
+ *
+ * @param {{ entries: [], totalCount: number }} data
+ * @param {HTMLElement}                          area
+ */
+function renderActivityLogList(data, area) {
+  var entries    = data.entries    || [];
+  var totalCount = data.totalCount || 0;
+
+  if (entries.length === 0) {
+    area.innerHTML =
+      '<div class="section-card" style="margin:var(--space-md)">' +
+        '<p class="log-empty">No activity found for the selected filters.</p>' +
+      '</div>';
+    return;
+  }
+
+  var html =
+    '<div class="log-count-strip">Showing ' + entries.length +
+    ' of ' + totalCount + ' entr' + (totalCount === 1 ? 'y' : 'ies') + '</div>' +
+    '<div class="section-card" style="margin:var(--space-md);padding:0;">';
+
+  entries.forEach(function (e) {
+    var ts       = e.timestamp ? new Date(e.timestamp) : null;
+    var dateStr  = ts ? ts.toLocaleDateString()  : '';
+    var timeStr  = ts ? ts.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '';
+    var catClass = getCategoryClass(e.category);
+
+    html +=
+      '<div class="log-entry">' +
+        '<div class="log-entry__header">' +
+          '<span class="log-entry__time">' + escHtml(dateStr + ' ' + timeStr) + '</span>' +
+          '<span class="log-entry__category log-entry__category--' + catClass + '">' +
+            escHtml(e.category || '') +
+          '</span>' +
+        '</div>' +
+        '<div class="log-entry__action">' + escHtml(e.action || '') + '</div>' +
+        (e.detail
+          ? '<div class="log-entry__detail">' + escHtml(e.detail) + '</div>'
+          : '') +
+        '<div class="log-entry__staff">' +
+          escHtml(e.staffName || e.staffId || '') +
+          (e.role ? ' · ' + escHtml(e.role) : '') +
+        '</div>' +
+      '</div>';
+  });
+
+  html += '</div>';
+  area.innerHTML = html;
+}
+
+/**
+ * Map a category string to its CSS modifier class.
+ * @param {string} category
+ * @returns {string}
+ */
+function getCategoryClass(category) {
+  var map = {
+    'Auth':            'auth',
+    'User Management': 'user',
+    'Configuration':   'config',
+    'Results':         'results',
+    'Corrections':     'corrections',
+    'Lock':            'lock',
+    'Archive':         'archive'
+  };
+  return map[category] || 'default';
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// STAGE 7: SUPER ADMIN SETTINGS VIEW
+// ═══════════════════════════════════════════════════════════════════════════════
+
+Views.superAdminSettings = function () {
+  return (
+    appBarHtml('SA Settings', 'Super Admin preferences', true, 'adminHome') +
+    '<div class="view-body" id="sa-settings-body">' +
+      '<div class="loading-placeholder">Loading settings&hellip;</div>' +
+    '</div>'
+  );
+};
+
+function initSuperAdminSettings() {
+  google.script.run
+    .withSuccessHandler(function (result) {
+      if (handleSessionExpired(result)) return;
+      var body = document.getElementById('sa-settings-body');
+      if (!body) return;
+
+      if (!result || !result.success) {
+        body.innerHTML =
+          '<div class="alert alert--error" style="margin:var(--space-md)">' +
+          escHtml((result && result.error) || 'Could not load settings.') + '</div>';
+        return;
+      }
+
+      renderSuperAdminSettings(result.data, body);
+    })
+    .withFailureHandler(function () {
+      var body = document.getElementById('sa-settings-body');
+      if (body) {
+        body.innerHTML =
+          '<div class="alert alert--error" style="margin:var(--space-md)">Connection error.</div>';
+      }
+    })
+    .serverGetSuperAdminSettings(App.token);
+}
+
+function renderSuperAdminSettings(data, body) {
+  var adminCanViewLog = !!data.adminCanViewLog;
+
+  body.innerHTML =
+    '<div class="sa-settings-card">' +
+      '<div class="sa-settings-card__title">Activity Log Access</div>' +
+      '<div class="toggle-row">' +
+        '<div>' +
+          '<div class="toggle-row__label">Allow Admins to view Activity Log</div>' +
+          '<div class="toggle-row__sub">When enabled, Admin accounts can see all log entries except Auth events.</div>' +
+        '</div>' +
+        '<label class="toggle-switch">' +
+          '<input type="checkbox" id="sa-admin-log-toggle"' +
+            (adminCanViewLog ? ' checked' : '') +
+            ' onchange="saveSuperAdminSettings()">' +
+          '<span class="toggle-switch__slider"></span>' +
+        '</label>' +
+      '</div>' +
+    '</div>' +
+    '<div id="sa-settings-alert" style="margin:0 var(--space-md)"></div>';
+}
+
+function saveSuperAdminSettings() {
+  var toggle    = document.getElementById('sa-admin-log-toggle');
+  var alertEl   = document.getElementById('sa-settings-alert');
+  var newValue  = toggle ? toggle.checked : false;
+
+  google.script.run
+    .withSuccessHandler(function (result) {
+      if (handleSessionExpired(result)) return;
+      if (!result || !result.success) {
+        if (alertEl) {
+          alertEl.innerHTML =
+            '<div class="alert alert--error">' + escHtml(result.error || 'Save failed.') + '</div>';
+        }
+        // Revert toggle on failure
+        if (toggle) toggle.checked = !newValue;
+        return;
+      }
+      showToast('Settings saved.', 'success');
+      if (alertEl) alertEl.innerHTML = '';
+    })
+    .withFailureHandler(function () {
+      if (alertEl) {
+        alertEl.innerHTML =
+          '<div class="alert alert--error">Connection error. Setting not saved.</div>';
+      }
+      if (toggle) toggle.checked = !newValue;
+    })
+    .serverSetSuperAdminSettings(App.token, { adminCanViewLog: newValue });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// END OF STAGE 7 ADDITIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+</script>
