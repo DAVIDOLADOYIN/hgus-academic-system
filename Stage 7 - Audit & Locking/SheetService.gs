@@ -972,10 +972,9 @@ const SheetService = (function () {
     // Stage 7: Result Locks
     getResultLock,
     upsertResultLock,
-    getResultLocksForSession,
-
-    // Stage 7 patch: new student data columns
-    ensureCacheStudentDataColumns
+    getResultLocksForSession
+    // Note: ensureCacheStudentDataColumns is attached directly to SheetService
+    // below the IIFE — it does not need to be listed here.
   };
 
 })();
@@ -999,19 +998,31 @@ const SheetService = (function () {
 // This function is added directly to the SheetService object so it is
 // accessible across all service files.
 SheetService.ensureCacheStudentDataColumns = function () {
+  // NOTE: This function is defined outside the SheetService IIFE, so it cannot
+  // use the private getSheet() helper. It accesses the sheet directly via
+  // SpreadsheetApp instead — functionally identical, just different entry point.
   try {
-    var sheet   = getSheet(SHEET_NAMES.STUDENTS_CACHE);
-    var headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0]
+    var sheet = SpreadsheetApp.getActiveSpreadsheet()
+                              .getSheetByName(SHEET_NAMES.STUDENTS_CACHE);
+    if (!sheet) {
+      Logger.log('ensureCacheStudentDataColumns: Students Cache sheet not found.');
+      return;
+    }
+
+    var lastCol = sheet.getLastColumn();
+    if (lastCol === 0) return; // Empty sheet — nothing to do.
+
+    var headers = sheet.getRange(1, 1, 1, lastCol).getValues()[0]
                        .map(function (h) { return String(h).trim(); });
 
     // Columns to guarantee exist in the Students Cache sheet.
+    // Add more entries here if future fields need to be cached.
     var needed = ['Date of Birth', 'Parent Contact'];
 
     needed.forEach(function (col) {
       if (headers.indexOf(col) === -1) {
         // Append the missing column header in the next available column.
-        var nextCol = sheet.getLastColumn() + 1;
-        sheet.getRange(1, nextCol).setValue(col);
+        sheet.getRange(1, sheet.getLastColumn() + 1).setValue(col);
       }
     });
   } catch (e) {

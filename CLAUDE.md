@@ -23,3 +23,20 @@ git push
 ```
 
 Suggested messages should be specific and descriptive (e.g. `"Add carry-forward service to Stage 6"`, not `"Update code"`).
+
+## Response Format
+Every response that makes a code change must end with a **"What was changed & how to implement"** section structured like this:
+
+### What was changed & how to implement
+
+**File(s) updated / added:**
+- List each file by name (not full path), with a one-line description of what changed.
+
+**What the change does:**
+- Plain-English explanation of the new behaviour. Assume the reader is non-technical.
+
+**How to implement (step by step):**
+1. Numbered steps the user must follow to get the change live (e.g. copy code into Apps Script, deploy web app, refresh sheet, etc.).
+2. Call out anything that must be done *before* or *after* the change takes effect.
+
+**Nothing else to do** (if no manual steps are needed, say so explicitly).

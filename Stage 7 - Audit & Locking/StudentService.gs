@@ -375,6 +375,16 @@ const StudentService = (function () {
       });
       SheetService.refreshStudentCache(cls.classId, toCache);
       totalCount += toCache.length;
+
+      // ── Keep the admin session alive during long refresh operations ────
+      // Each class processed resets the 5-minute session TTL in CacheService.
+      // Without this, refreshing all 12 classes could outlast the session
+      // and force the admin to re-login immediately after the refresh ends.
+      try {
+        CacheService.getScriptCache().put(token, JSON.stringify(sess), 300);
+      } catch (e) {
+        Logger.log('StudentService: session touch failed for class ' + cls.classId + ': ' + e.message);
+      }
     });
 
     var scope = classId === 'all'
