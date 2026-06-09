@@ -1017,7 +1017,9 @@ SheetService.ensureCacheStudentDataColumns = function () {
 
     // Columns to guarantee exist in the Students Cache sheet.
     // Add more entries here if future fields need to be cached.
-    var needed = ['Date of Birth', 'Parent Contact'];
+    // 'Last Name' and 'First Middle Name' are used by result slips
+    // to build the SURNAME-FIRST display format.
+    var needed = ['Date of Birth', 'Parent Contact', 'Last Name', 'First Middle Name'];
 
     needed.forEach(function (col) {
       if (headers.indexOf(col) === -1) {

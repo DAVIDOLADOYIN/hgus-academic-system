@@ -328,14 +328,21 @@ const StudentService = (function () {
         fullName = String(row[colFullName] || '').trim();
       }
 
+      // Store name components separately so result slips can display
+      // SURNAME-FIRST format while all other views keep the regular fullName.
+      var rawFirstMiddle = hasNewNameCols ? firstName : '';  // e.g. "David Obi"
+      var rawLastName    = hasNewNameCols ? lastName  : '';  // e.g. "Smith"
+
       return {
-        studentId:     String(row[colStudentId]  || '').trim(),
-        fullName:      fullName,
-        studentClass:  String(row[colClass]       || '').trim(),
-        gender:        colGender      >= 0 ? String(row[colGender]      || '').trim() : '',
-        actionFlag:    colActionFlag  >= 0 ? String(row[colActionFlag]  || '').trim() : '',
-        dateOfBirth:   colDOB         >= 0 ? String(row[colDOB]         || '').trim() : '',
-        parentContact: colParentPhone >= 0 ? String(row[colParentPhone] || '').trim() : ''
+        studentId:       String(row[colStudentId]  || '').trim(),
+        fullName:        fullName,
+        firstMiddleName: rawFirstMiddle,  // stored for result slip SURNAME-FIRST display
+        lastName:        rawLastName,     // stored for result slip SURNAME-FIRST display
+        studentClass:    String(row[colClass]       || '').trim(),
+        gender:          colGender      >= 0 ? String(row[colGender]      || '').trim() : '',
+        actionFlag:      colActionFlag  >= 0 ? String(row[colActionFlag]  || '').trim() : '',
+        dateOfBirth:     colDOB         >= 0 ? String(row[colDOB]         || '').trim() : '',
+        parentContact:   colParentPhone >= 0 ? String(row[colParentPhone] || '').trim() : ''
       };
     }).filter(function (s) {
       // Drop rows missing the three required values.
@@ -363,14 +370,16 @@ const StudentService = (function () {
       });
       var toCache = studentsForClass.map(function (s) {
         return {
-          studentId:     s.studentId,
-          fullName:      s.fullName,
-          studentClass:  s.studentClass,
-          gender:        s.gender,
-          actionFlag:    s.actionFlag,
-          dateOfBirth:   s.dateOfBirth,
-          parentContact: s.parentContact,
-          classId:       cls.classId
+          studentId:       s.studentId,
+          fullName:        s.fullName,
+          firstMiddleName: s.firstMiddleName || '',  // e.g. "David Obi"
+          lastName:        s.lastName        || '',  // e.g. "Smith"
+          studentClass:    s.studentClass,
+          gender:          s.gender,
+          actionFlag:      s.actionFlag,
+          dateOfBirth:     s.dateOfBirth,
+          parentContact:   s.parentContact,
+          classId:         cls.classId
         };
       });
       SheetService.refreshStudentCache(cls.classId, toCache);

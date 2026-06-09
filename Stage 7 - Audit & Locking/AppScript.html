@@ -4135,7 +4135,9 @@ function renderResultSlip(body, data) {
   html += '<div class="section-card">';
   html += '<div class="section-title">STUDENT INFORMATION</div>';
   html += '<div class="info-card__row"><span>Student ID</span><strong>' + escHtml(student.studentId || '') + '</strong></div>';
-  html += '<div class="info-card__row"><span>Name</span><strong>' + escHtml(student.name || '') + '</strong></div>';
+  // slipName is set by ResultService Stage 7 patch: "SMITH David Obi" format.
+  // Falls back to student.name (fullName) if the cache hasn't been refreshed yet.
+  html += '<div class="info-card__row"><span>Name</span><strong>' + escHtml(student.slipName || student.name || '') + '</strong></div>';
   html += '<div class="info-card__row"><span>Class</span><strong>' + escHtml(student.className || '') + '</strong></div>';
   html += '<div class="info-card__row"><span>Session</span><strong>' + escHtml(data.session || '') + '</strong></div>';
   html += '<div class="info-card__row"><span>Term</span><strong>' + escHtml(data.term || '') + '</strong></div>';
