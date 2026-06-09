@@ -972,7 +972,49 @@ const SheetService = (function () {
     // Stage 7: Result Locks
     getResultLock,
     upsertResultLock,
-    getResultLocksForSession
+    getResultLocksForSession,
+
+    // Stage 7 patch: new student data columns
+    ensureCacheStudentDataColumns
   };
 
 })();
+
+
+// ─── STAGE 7 PATCH: ensureCacheStudentDataColumns ────────────────────────────
+// The external StudentData sheet now includes Date of Birth and
+// Parent / Guardian Contact. This function checks whether those two columns
+// exist in the Students Cache sheet and appends them if they are missing.
+//
+// Called automatically by StudentService.refreshStudentCache (IIFE patch)
+// before every cache write, so the columns are always present before data
+// is written. Safe to call multiple times — it is a no-op if the columns
+// already exist.
+//
+// HOW TO MODIFY:
+//   Add more column names to the `needed` array to ensure additional columns
+//   are present in the Students Cache sheet.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// This function is added directly to the SheetService object so it is
+// accessible across all service files.
+SheetService.ensureCacheStudentDataColumns = function () {
+  try {
+    var sheet   = getSheet(SHEET_NAMES.STUDENTS_CACHE);
+    var headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0]
+                       .map(function (h) { return String(h).trim(); });
+
+    // Columns to guarantee exist in the Students Cache sheet.
+    var needed = ['Date of Birth', 'Parent Contact'];
+
+    needed.forEach(function (col) {
+      if (headers.indexOf(col) === -1) {
+        // Append the missing column header in the next available column.
+        var nextCol = sheet.getLastColumn() + 1;
+        sheet.getRange(1, nextCol).setValue(col);
+      }
+    });
+  } catch (e) {
+    Logger.log('SheetService.ensureCacheStudentDataColumns error: ' + e.message);
+  }
+};
