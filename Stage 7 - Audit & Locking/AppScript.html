@@ -960,14 +960,38 @@ Views.sessionSettings = function () {
       '<p class="text-sm text-muted mb-md">Enter the Google Spreadsheet ID of the school\'s student registration sheet. ' +
         'This is the long ID in the URL: docs.google.com/spreadsheets/d/<strong>SPREADSHEET_ID</strong>/edit</p>' +
       '<div class="form-group">' +
-        '<label class="form-label" for="ss-extid">External Sheet ID</label>' +
+        // Label row: "External Sheet ID" + lock badge (badge hidden if no ID saved yet)
+        '<div style="display:flex;align-items:center;gap:6px;margin-bottom:4px">' +
+          '<label class="form-label" for="ss-extid" style="margin-bottom:0">External Sheet ID</label>' +
+          '<span class="lock-badge lock-badge--sm" id="ss-extid-lock-badge"' +
+            (s.externalSheetId ? '' : ' style="display:none"') + '>🔒 Locked</span>' +
+        '</div>' +
+        // Input — disabled (greyed) when an ID is already saved; editable otherwise
         '<input class="form-input" type="text" id="ss-extid" placeholder="Paste the Spreadsheet ID here" ' +
-          'value="' + escHtml(s.externalSheetId || '') + '" autocapitalize="none" spellcheck="false">' +
-        '<div class="form-hint">The sheet must have a tab named like "25/26 StudentData" (academic year + "StudentData"). Required columns: <strong>Student ID</strong>, <strong>First Name / Middle Name</strong>, <strong>Last Name (Surname)</strong>, <strong>Class</strong>. Optional: Gender, Action Flag, Date of Birth, Parent / Guardian Contact.</div>' +
+          'value="' + escHtml(s.externalSheetId || '') + '" autocapitalize="none" spellcheck="false"' +
+          (s.externalSheetId ? ' disabled style="background:var(--grey-50);color:var(--color-text-sec);cursor:not-allowed"' : '') + '>' +
+        // Change warning — only shown when the user has unlocked an existing ID for editing
+        '<div id="ss-extid-change-warning" style="display:none;margin-top:4px;padding:6px 10px;' +
+          'background:#fff3e0;border-left:3px solid #e65100;border-radius:4px;' +
+          'font-size:var(--text-xs);color:#e65100">' +
+          '⚠ Changing the Sheet ID will require a full student list refresh after saving.' +
+        '</div>' +
+        '<div class="form-hint">The sheet must have a tab named like "25/26 StudentData" (academic year + "StudentData"). ' +
+          'Required columns: <strong>Student ID</strong>, <strong>First Name / Middle Name</strong>, ' +
+          '<strong>Last Name (Surname)</strong>, <strong>Class</strong>. ' +
+          'Optional: Gender, Action Flag, Date of Birth, Parent / Guardian Contact.</div>' +
       '</div>' +
-      '<button class="btn btn--secondary btn--full" id="ss-extid-save-btn" onclick="saveExternalSheetId()">' +
-        '<span class="btn-text">Save Sheet ID</span><span class="spinner"></span>' +
-      '</button>' +
+      // Button row: Save/Edit button + Cancel link (cancel only visible during editing)
+      '<div style="display:flex;align-items:center;gap:var(--space-sm)">' +
+        '<button class="btn btn--secondary btn--full" id="ss-extid-save-btn" onclick="handleSheetIdBtn()">' +
+          '<span class="btn-text" id="ss-extid-btn-label">' +
+            (s.externalSheetId ? 'Edit Sheet ID' : 'Save Sheet ID') +
+          '</span><span class="spinner"></span>' +
+        '</button>' +
+        '<a id="ss-extid-cancel-link" href="javascript:void(0)" onclick="cancelSheetIdEdit()" ' +
+          'style="display:none;white-space:nowrap;font-size:var(--text-sm);' +
+          'color:var(--color-text-sec);text-decoration:underline">Cancel</a>' +
+      '</div>' +
     '</div>' +
     '<div class="card card--pad mb-md">' +
       '<div class="section-header-inline">Data Sync</div>' +
@@ -1047,12 +1071,98 @@ function saveExternalSheetId() {
       if (!result.success) { showToast(result.error, 'error'); return; }
       App.settings = result.data;
       showToast('External Sheet ID saved.', 'success');
+      // Lock the field after a successful save so it can't be edited by accident.
+      lockSheetIdField();
     })
     .withFailureHandler(function () {
       setButtonLoading('ss-extid-save-btn', false);
       showToast('Connection error. Please try again.', 'error');
     })
     .serverSetSessionSettings(App.token, { externalSheetId: extId });
+}
+
+/**
+ * Unified button handler for the Sheet ID button.
+ * Checks whether the field is currently locked or editable and routes accordingly.
+ * - Locked  → unlock for editing (toggleSheetIdEdit)
+ * - Editable → save the new value (saveExternalSheetId)
+ */
+function handleSheetIdBtn() {
+  const input = document.getElementById('ss-extid');
+  if (!input) return;
+  if (input.disabled) {
+    toggleSheetIdEdit();
+  } else {
+    saveExternalSheetId();
+  }
+}
+
+/**
+ * Unlock the Sheet ID input for editing.
+ * Stores the current saved value so Cancel can restore it.
+ * Shows the change-warning and the Cancel link.
+ */
+function toggleSheetIdEdit() {
+  const input   = document.getElementById('ss-extid');
+  const btnLbl  = document.getElementById('ss-extid-btn-label');
+  const badge   = document.getElementById('ss-extid-lock-badge');
+  const warning = document.getElementById('ss-extid-change-warning');
+  const cancel  = document.getElementById('ss-extid-cancel-link');
+  if (!input) return;
+
+  // Remember the original value so Cancel can restore it.
+  input.dataset.originalValue = input.value;
+
+  // Enable the field and give it focus.
+  input.disabled       = false;
+  input.style.background = '';
+  input.style.color      = '';
+  input.style.cursor     = '';
+  input.focus();
+  input.select(); // highlight the current value for easy replacement
+
+  if (btnLbl)  btnLbl.textContent    = 'Save Sheet ID';
+  if (badge)   badge.style.display   = 'none';
+  if (warning) warning.style.display = 'block';
+  if (cancel)  cancel.style.display  = 'inline';
+}
+
+/**
+ * Cancel editing — restore the original Sheet ID value and re-lock the field.
+ * The user never left the locked state from the data's point of view.
+ */
+function cancelSheetIdEdit() {
+  const input = document.getElementById('ss-extid');
+  if (!input) return;
+  // Restore whatever was saved before the user unlocked.
+  if (input.dataset.originalValue !== undefined) {
+    input.value = input.dataset.originalValue;
+  }
+  lockSheetIdField();
+}
+
+/**
+ * Lock the Sheet ID field.
+ * Called after a successful save or when the user cancels editing.
+ * Disables the input visually and resets all UI elements to locked state.
+ */
+function lockSheetIdField() {
+  const input   = document.getElementById('ss-extid');
+  const btnLbl  = document.getElementById('ss-extid-btn-label');
+  const badge   = document.getElementById('ss-extid-lock-badge');
+  const warning = document.getElementById('ss-extid-change-warning');
+  const cancel  = document.getElementById('ss-extid-cancel-link');
+  if (!input) return;
+
+  input.disabled         = true;
+  input.style.background = 'var(--grey-50)';
+  input.style.color      = 'var(--color-text-sec)';
+  input.style.cursor     = 'not-allowed';
+
+  if (btnLbl)  btnLbl.textContent    = 'Edit Sheet ID';
+  if (badge)   badge.style.display   = 'inline-flex';
+  if (warning) warning.style.display = 'none';
+  if (cancel)  cancel.style.display  = 'none';
 }
 
 /**
