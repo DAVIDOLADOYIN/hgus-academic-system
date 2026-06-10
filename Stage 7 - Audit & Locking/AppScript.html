@@ -4356,7 +4356,7 @@ function initStudentResultSlip(params) {
       pdfBar.innerHTML =
         '<button class="pdf-action-bar__btn pdf-action-bar__btn--primary" ' +
           'id="pdf-single-btn" onclick="onDownloadPdf()">' +
-          '&#8659; Download PDF' +
+          'Download PDF' +
         '</button>';
       body.appendChild(pdfBar);
     })
@@ -4565,7 +4565,7 @@ function onDownloadPdf() {
       // Re-enable button regardless of success/fail so user can retry
       if (btn) {
         btn.disabled  = false;
-        btn.innerHTML = '&#8659; Download PDF';
+        btn.innerHTML = 'Download PDF';
       }
       if (handleSessionExpired(result)) return;
       if (!result.success) {
@@ -4577,7 +4577,7 @@ function onDownloadPdf() {
     .withFailureHandler(function () {
       if (btn) {
         btn.disabled  = false;
-        btn.innerHTML = '&#8659; Download PDF';
+        btn.innerHTML = 'Download PDF';
       }
       showToast('Connection error. PDF not generated.', 'error');
     })
